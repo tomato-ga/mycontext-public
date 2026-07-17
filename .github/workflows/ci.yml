@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mycontext-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: mycontext-sync/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: mycontext-sync
+      - run: ./scripts/check-public-safety.sh
+      - run: pnpm run typecheck
+        working-directory: mycontext-sync
+      - run: pnpm test
+        working-directory: mycontext-sync
+      - run: pnpm audit --audit-level moderate
+        working-directory: mycontext-sync
+
+  mycontext-mcp-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: mycontext-mcp-worker/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: mycontext-mcp-worker
+      - run: ./scripts/check-public-safety.sh
+      - run: pnpm run typecheck
+        working-directory: mycontext-mcp-worker
+      - run: pnpm test
+        working-directory: mycontext-mcp-worker
+      - run: pnpm audit --audit-level moderate
+        working-directory: mycontext-mcp-worker

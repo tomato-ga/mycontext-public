@@ -1,0 +1,6 @@
+// Replace this example origin with the Worker URL assigned to your deployment.
+export const PUBLIC_ORIGIN = "https://mycontext-mcp.example.workers.dev";
+export const MCP_ROUTE = "/mcp";
+export const MCP_RESOURCE = `${PUBLIC_ORIGIN}${MCP_ROUTE}`;
+export const MCP_SCOPE = "context:read";
+export const GITHUB_CALLBACK_URL = `${PUBLIC_ORIGIN}/oauth/github/callback`;
