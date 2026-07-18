@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildSearchToolResult } from "../src/tools/searchResult.js";
 
 describe("buildSearchToolResult", () => {
-  it("keeps existing document hits excerpted and returns a full business delivery section", () => {
+  it("returns compact results with stable IDs and no duplicated resources", () => {
     const longNotionText = `before-${"x".repeat(2_000)}-needle-after`;
     const deliveryMarkdown = "## Parent section\n\nThe complete semantic section.";
     const result = buildSearchToolResult([
@@ -11,7 +11,10 @@ describe("buildSearchToolResult", () => {
         source: "notion",
         title: "Profile",
         text: longNotionText,
-        match_position: longNotionText.indexOf("needle") + 1
+        match_position: longNotionText.indexOf("needle") + 1,
+        matched_terms: ["needle"],
+        score: 100,
+        search_stage: "phrase"
       },
       {
         document_id: "business-knowledge:startup-science",
@@ -19,6 +22,9 @@ describe("buildSearchToolResult", () => {
         title: "起業の科学",
         text: deliveryMarkdown,
         match_position: 1,
+        matched_terms: ["semantic"],
+        score: 7,
+        search_stage: "keywords",
         matched_span_position: 4,
         matched_section_id: "detail-18-interview",
         matched_section_title: "Interview",
@@ -41,28 +47,18 @@ describe("buildSearchToolResult", () => {
       }
     ]);
 
-    const structured = result.structuredContent as { results: Array<{ text: string }> };
-    expect(structured.results[0].text.length).toBeLessThan(longNotionText.length);
-    expect(structured.results[0].text).toContain("needle");
-    expect(structured.results[1].text).toBe(deliveryMarkdown);
-    expect(result.content).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: "resource",
-        resource: expect.objectContaining({
-          uri: "mycontext://business-knowledge/startup-science/sections/detail-18",
-          text: deliveryMarkdown,
-          _meta: expect.objectContaining({
-            matchedContentLayer: "detail",
-            deliveryContentLayer: "detail",
-            ingestScope: "full_summary",
-            detailAvailable: null
-          })
-        })
-      }),
-      expect.objectContaining({
-        type: "resource_link",
-        uri: "mycontext://business-knowledge/startup-science/sections/detail-18"
-      })
-    ]));
+    const structured = result.structuredContent as {
+      results: Array<{ id: string; snippet: string; matchedTerms: string[] }>
+    };
+    expect(structured.results[0].snippet.length).toBeLessThan(longNotionText.length);
+    expect(structured.results[0].snippet).toContain("needle");
+    expect(structured.results[0].id).toBe("notion:page-1");
+    expect(structured.results[1]).toMatchObject({
+      id: "business-knowledge:startup-science#detail-18",
+      matchedTerms: ["semantic"]
+    });
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0]).toMatchObject({ type: "text" });
+    expect(JSON.stringify(result)).not.toContain("\"type\":\"resource\"");
   });
 });

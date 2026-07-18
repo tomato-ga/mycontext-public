@@ -21,12 +21,14 @@ endpoint at `/healthz`.
   Worker-side `UNION ALL` read model; author style and Metaskill remain on
   dedicated retrieval paths.
 - Search:
-  - `search_context`: plain-text LIKE search over full Notion/editor Markdown;
-    business knowledge searches the smallest semantic spans and expands each
+  - `search_personal_context`: full-phrase search followed by bounded Japanese
+    keyword extraction, title-weighted OR ranking, and a small synonym fallback.
+    Business knowledge searches the smallest semantic spans and expands each
     hit to its complete delivery section (Small2Big).
-  - `search_text`: explicit LIKE fallback alias for exact terms and debugging.
 - Auth: OAuth 2.1 authorization code flow with S256 PKCE. Cloudflare's OAuth
   provider issues and validates MCP access and refresh tokens.
+- Session continuity: `offline_access` is advertised and accepted alongside
+  the required `context:read` scope so compatible clients can refresh access.
 - Identity: GitHub OAuth is used only to authenticate the resource owner. Access
   is restricted to the immutable numeric GitHub user ID in
   `GITHUB_ALLOWED_USER_ID`; the upstream GitHub token is not persisted.
@@ -42,11 +44,10 @@ does not run migrations, and does not expose a raw SQL tool.
 
 ## Tools
 
-- `list_documents`
-- `search_context`
-- `search_text`
-- `get_document`
-- `health_check`
+- `search_personal_context`: accepts the user's full question and returns
+  compact ranked candidates with stable IDs.
+- `read_context`: accepts exactly one stable ID returned by search and returns
+  the selected Markdown once.
 - `get_author_style_context`: normal generation/edit/evaluation path; returns
   one selector-specific context pack without truncating semantic sections.
 - `search_author_style_evidence`: audit path over evidence/profile/ops layers;
@@ -58,9 +59,9 @@ does not run migrations, and does not expose a raw SQL tool.
 
 Document IDs are namespaced as `notion:<page-id>` and
 `editor-knowledge:<document-id>` or `business-knowledge:<document-id>`.
-`get_document` accepts exactly one of the legacy Notion-only `pageId`, unified
-`documentId`, or semantic `sectionId` in
-`business-knowledge:<document-id>#<local-section-id>` format.
+`read_context` accepts the namespaced document ID directly, or a semantic
+section ID in `business-knowledge:<document-id>#<local-section-id>` format.
+Clients should copy the returned search ID unchanged rather than constructing it.
 
 ## Resources
 
@@ -77,17 +78,17 @@ Active semantic sections use this template:
 mycontext://business-knowledge/{documentId}/sections/{sectionId}
 ```
 
-Search results retain text and structured output, and business hits also carry
-an embedded Markdown resource plus a resource link. Only section rows whose
+Search results use compact structured candidates and one short text summary;
+they do not duplicate the same payload as JSON, resources, and resource links.
+Only section rows whose
 `section_revision_sha256` matches the owning document are visible. Business
 results and resources expose `source_kind`, `ingest_scope`,
 `source_declared_at`, `detail_available`, content layers, freshness, and any
 relative `related_source_path`, so an index-only source is not mistaken for
 stored detail.
 
-`health_check` counts actual active-revision section rows and actual searchable
-rows. It does not trust the document-level declared counts; inability to read
-the section table therefore reports `db: "error"`.
+Operational health remains available at `/healthz`; it is not exposed as a
+general conversation tool.
 
 Author-style full-source audit resources are available at:
 
@@ -190,6 +191,9 @@ The client discovers OAuth automatically. The GitHub OAuth App callback URL is:
 https://mycontext-mcp.example.workers.dev/oauth/github/callback
 ```
 
+After changing tool descriptors or OAuth metadata, disconnect and reconnect the
+client integration so it refreshes the tool and authorization snapshots.
+
 ## Development Checks
 
 ```bash
@@ -198,6 +202,9 @@ pnpm test
 pnpm run test:live-author-style
 pnpm run test:live-metaskill
 ```
+
+Wrangler observability is enabled for sampled logs and traces. Tool logs record
+query length and a SHA-256 query hash, not the raw query or returned Markdown.
 
 The live author-style smoke test uses the read-only `TIDB_DATABASE_URL` from
 `.dev.vars`, lists both MCP tools through an in-memory MCP transport, and calls

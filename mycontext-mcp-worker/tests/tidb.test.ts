@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildDocumentReadModelSql,
+  buildKeywordSearchParams,
+  buildKeywordSearchSql,
   buildLikePattern,
   buildSearchSql,
   checkHealth,
@@ -68,6 +70,25 @@ describe("buildSearchSql", () => {
     expect(sql).toContain("LOCATE(?, documents.markdown) AS match_position");
     expect(sql).not.toContain("VEC_COSINE_DISTANCE");
     expect(sql).not.toMatch(/\bDELETE\b/i);
+  });
+});
+
+describe("keyword fallback SQL", () => {
+  it("builds a bounded OR search with title-weighted ranking", () => {
+    const sql = buildKeywordSearchSql(3, 5);
+    expect(sql).toContain("matched_sections.retrieval_text LIKE ?");
+    expect(sql).toContain("documents.markdown LIKE ?");
+    expect(sql).toContain("documents.title LIKE ?");
+    expect(sql).toContain("ORDER BY search_score DESC");
+    expect(sql).toContain("LIMIT 5");
+    expect(sql).not.toContain("VEC_COSINE_DISTANCE");
+    expect(buildKeywordSearchParams(["個人開発", "AIエージェント", "収益化"]))
+      .toHaveLength(24);
+  });
+
+  it("rejects unbounded fallback term counts", () => {
+    expect(() => buildKeywordSearchSql(0, 3)).toThrow(RangeError);
+    expect(() => buildKeywordSearchSql(9, 3)).toThrow(RangeError);
   });
 });
 
@@ -301,6 +322,9 @@ describe("business knowledge section retrieval", () => {
       title: "起業の科学",
       text: "## 18. エバンジェリストカスタマー\n\n親セクション全文",
       match_position: 4,
+      matched_terms: ["インタビュー"],
+      score: 100,
+      search_stage: "phrase",
       matched_span_position: 7,
       matched_section_id: "detail-18-problem-interview",
       matched_section_title: "プロブレムインタビューの5つのポイント",
@@ -405,6 +429,64 @@ describe("business knowledge section retrieval", () => {
       detail_available: false,
       related_source_path: "sections/10-ai-agent-aeo.md"
     })]);
+  });
+});
+
+describe("natural-language search fallback", () => {
+  it("falls back from an absent full phrase to ranked keyword search", async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        document_id: "notion:profile",
+        source: "notion",
+        source_id: "profile",
+        title: "個人開発とAIスキル",
+        markdown: "現在はAIエージェント構築と個人開発に取り組み、事業化を目指している。",
+        match_position: 1,
+        search_score: "6"
+      }]);
+    const client: TidbClient = { execute };
+
+    const hits = await searchContext(
+      client,
+      "個人開発・AIエージェント活用・収益化目標に関する背景と強み",
+      3
+    );
+
+    expect(hits).toEqual([expect.objectContaining({
+      document_id: "notion:profile",
+      matched_terms: expect.arrayContaining([
+        "個人開発",
+        "AIエージェント"
+      ]),
+      score: 6,
+      search_stage: "keywords"
+    })]);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute.mock.calls[1][0]).toContain("ORDER BY search_score DESC");
+  });
+
+  it("uses synonyms only after phrase and keyword searches both miss", async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        document_id: "notion:business",
+        source: "notion",
+        source_id: "business",
+        title: "事業計画",
+        markdown: "プロダクトの事業化を進める。",
+        match_position: 1,
+        search_score: 1
+      }]);
+    const client: TidbClient = { execute };
+
+    const hits = await searchContext(client, "収益化について教えて", 3);
+    expect(hits[0]).toMatchObject({
+      matched_terms: ["事業化"],
+      search_stage: "synonyms"
+    });
+    expect(execute).toHaveBeenCalledTimes(3);
   });
 });
 
