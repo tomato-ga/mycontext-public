@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 const MAX_SEARCH_TERMS = 8;
 const JAPANESE_WORD_SEGMENTER = new Intl.Segmenter("ja-JP", {
   granularity: "word"
@@ -93,23 +95,76 @@ const QUERY_STOP_WORDS = new Set([
   "どんなもの"
 ]);
 
-const TERM_ALIASES: Record<string, readonly string[]> = {
-  "能力": ["スキルマップ", "スキル"],
-  "事業": ["起業", "経営"],
-  "会社経営": ["経営", "起業"],
-  "考える": ["考え"],
-  "検索": ["SEO", "AEO"],
-  "生成AI": ["AI"],
-  "Webメディア": ["ウェブメディア"]
+/**
+ * The curated term-alias/synonym-group data itself (names, revenue figures, and other
+ * personally-tuned vocabulary) is never hardcoded in this file — it is loaded at runtime from
+ * the optional PERSONAL_SYNONYMS secret (see config.ts / parsePersonalSynonymConfig below) and
+ * threaded through as plain function arguments, defaulting to EMPTY_PERSONAL_SYNONYM_CONFIG
+ * everywhere. With no secret configured, search still works; it just performs no personal
+ * synonym expansion.
+ */
+export interface TermAliasEntry {
+  aliases: readonly string[];
+  /**
+   * When true and aliases are present, the original matched term itself is dropped from the
+   * expansion and only its aliases are kept (e.g. a short nickname resolving to a full,
+   * unambiguous name). Defaults to false: both the term and its aliases are kept.
+   */
+  suppressOriginalTerm?: boolean;
+}
+
+export type TermAliasMap = Readonly<Record<string, TermAliasEntry>>;
+export type SynonymGroups = readonly (readonly string[])[];
+
+export interface PersonalSynonymConfig {
+  termAliases: TermAliasMap;
+  synonymGroups: SynonymGroups;
+}
+
+export const EMPTY_PERSONAL_SYNONYM_CONFIG: PersonalSynonymConfig = {
+  termAliases: {},
+  synonymGroups: []
 };
 
-const SYNONYM_GROUPS = [
-  ["個人開発", "個人プロダクト", "一人開発"],
-  ["AIエージェント", "AI agent", "エージェント"],
-  ["収益化", "事業化", "マネタイズ", "収益"],
-  ["編集", "編集者", "コンテンツ制作"],
-  ["業務自動化", "自動化", "オートメーション"]
-] as const;
+const termAliasEntrySchema = z.object({
+  aliases: z.array(z.string().min(1)).min(1),
+  suppressOriginalTerm: z.boolean().optional()
+});
+
+const personalSynonymConfigSchema = z.object({
+  termAliases: z.record(z.string(), termAliasEntrySchema).default({}),
+  synonymGroups: z.array(z.array(z.string().min(1)).min(2)).default([])
+});
+
+/**
+ * Parses the PERSONAL_SYNONYMS secret (a JSON string) into a PersonalSynonymConfig. Missing,
+ * blank, or malformed input safely falls back to EMPTY_PERSONAL_SYNONYM_CONFIG (logging a
+ * warning if a value was present but invalid) rather than throwing — a misconfigured optional
+ * secret must never break search.
+ *
+ * Expected shape:
+ * {
+ *   "termAliases": {
+ *     "<term>": { "aliases": ["<alias>", ...], "suppressOriginalTerm": false }
+ *   },
+ *   "synonymGroups": [["<term>", "<synonym>", ...], ...]
+ * }
+ */
+export function parsePersonalSynonymConfig(raw: string | undefined): PersonalSynonymConfig {
+  if (raw === undefined || raw.trim().length === 0) {
+    return EMPTY_PERSONAL_SYNONYM_CONFIG;
+  }
+  try {
+    const parsed = personalSynonymConfigSchema.parse(JSON.parse(raw));
+    return {
+      termAliases: parsed.termAliases,
+      synonymGroups: parsed.synonymGroups
+    };
+  } catch {
+    console.warn("personal_synonyms_config_invalid");
+    return EMPTY_PERSONAL_SYNONYM_CONFIG;
+  }
+}
 
 export interface SearchQueryPlan {
   phrase: string;
@@ -117,13 +172,16 @@ export interface SearchQueryPlan {
   synonymTerms: string[];
 }
 
-export function buildSearchQueryPlan(query: string): SearchQueryPlan {
+export function buildSearchQueryPlan(
+  query: string,
+  config: PersonalSynonymConfig = EMPTY_PERSONAL_SYNONYM_CONFIG
+): SearchQueryPlan {
   const phrase = normalizeSearchText(query);
-  const terms = extractSearchTerms(phrase);
+  const terms = extractSearchTerms(phrase, config.termAliases);
   return {
     phrase,
     terms,
-    synonymTerms: expandSynonyms(terms)
+    synonymTerms: expandSynonyms(terms, config.synonymGroups)
   };
 }
 
@@ -131,7 +189,10 @@ export function normalizeSearchText(value: string): string {
   return value.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
-export function extractSearchTerms(query: string): string[] {
+export function extractSearchTerms(
+  query: string,
+  termAliases: TermAliasMap = {}
+): string[] {
   let working = normalizeSearchText(query);
   for (const prefix of REQUEST_PREFIXES) {
     if (working.startsWith(prefix)) {
@@ -145,7 +206,7 @@ export function extractSearchTerms(query: string): string[] {
   }
 
   const coarseParts = working
-    .split(/[\s\u3000・、。,.!?！？:：;；/／|｜()[\]{}「」『』【】〈〉《》]+/u)
+    .split(/[\s　・、。,.!?！？:：;；/／|｜()[\]{}「」『』【】〈〉《》]+/u)
     .flatMap(splitJapaneseConnectors)
     .map(cleanTerm)
     .filter(isUsefulTerm);
@@ -153,28 +214,41 @@ export function extractSearchTerms(query: string): string[] {
   const expanded: string[] = [];
   for (const part of coarseParts) {
     for (const term of deriveTerms(part)) {
-      expanded.push(term, ...(TERM_ALIASES[term] ?? []));
+      const entry = termAliases[term];
+      const aliases = entry?.aliases ?? [];
+      if (entry?.suppressOriginalTerm === true && aliases.length > 0) {
+        expanded.push(...aliases);
+      } else {
+        expanded.push(term, ...aliases);
+      }
     }
   }
   for (const part of segmentJapaneseWords(working)) {
     if (expanded.some((term) =>
       term !== part &&
       term.includes(part) &&
-      !/[ぁ-ん]/u.test(term)
+      !/[ぁ-ん]/u.test(term) &&
+      (
+        term.length - part.length <= 2 ||
+        /^[A-Za-z0-9]+$/u.test(part)
+      )
     )) {
       continue;
     }
-    expanded.push(part, ...(TERM_ALIASES[part] ?? []));
+    expanded.push(part, ...(termAliases[part]?.aliases ?? []));
   }
 
-  return rankTerms(uniqueTerms(expanded)).slice(0, MAX_SEARCH_TERMS);
+  return rankTerms(uniqueTerms(expanded), termAliases).slice(0, MAX_SEARCH_TERMS);
 }
 
-export function expandSynonyms(terms: string[]): string[] {
+export function expandSynonyms(
+  terms: string[],
+  synonymGroups: SynonymGroups = []
+): string[] {
   const expanded: string[] = [];
   for (const term of terms) {
     const normalizedTerm = term.toLocaleLowerCase("ja");
-    const group = SYNONYM_GROUPS.find((candidate) =>
+    const group = synonymGroups.find((candidate) =>
       candidate.some((value) => value.toLocaleLowerCase("ja") === normalizedTerm)
     );
     if (group === undefined) continue;
@@ -249,16 +323,16 @@ function segmentJapaneseWords(value: string): string[] {
     .filter(isUsefulTerm);
 }
 
-function rankTerms(terms: string[]): string[] {
+function rankTerms(terms: string[], termAliases: TermAliasMap): string[] {
   return terms
-    .map((term, index) => ({ term, index, score: termScore(term) }))
+    .map((term, index) => ({ term, index, score: termScore(term, termAliases) }))
     .sort((left, right) => right.score - left.score || left.index - right.index)
     .map(({ term }) => term);
 }
 
-function termScore(term: string): number {
+function termScore(term: string, termAliases: TermAliasMap): number {
   let score = Math.min(term.length, 8);
   if (/[A-Za-z0-9]/u.test(term)) score += 2;
-  if (TERM_ALIASES[term] !== undefined) score += 1;
+  if (termAliases[term] !== undefined) score += 1;
   return score;
 }

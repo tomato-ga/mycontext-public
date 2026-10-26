@@ -1,10 +1,16 @@
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { ResourceTemplate, type McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  ProtocolError,
+  ProtocolErrorCode,
+  ResourceNotFoundError,
+  ResourceTemplate,
+  type McpServer
+} from "@modelcontextprotocol/server";
 import {
   BUSINESS_KNOWLEDGE_DOCUMENT_IDS,
   buildBusinessKnowledgeDocumentUri,
   buildBusinessKnowledgeSectionUri,
-  toBusinessKnowledgeDocumentId
+  toBusinessKnowledgeDocumentId,
+  type BusinessKnowledgeDocumentId
 } from "../businessKnowledge.js";
 import {
   getBusinessKnowledgeSection,
@@ -16,6 +22,12 @@ import {
 export const BUSINESS_KNOWLEDGE_SECTION_URI_TEMPLATE =
   "mycontext://business-knowledge/{documentId}/sections/{sectionId}";
 
+const BUSINESS_KNOWLEDGE_DOCUMENT_TITLES: Record<BusinessKnowledgeDocumentId, string> = {
+  "startup-science": "起業の科学",
+  "marketing-wisdom": "Wisdom Evolution Marketing",
+  "example-business-guide": "Example business guide"
+};
+
 export function registerBusinessKnowledgeResources(server: McpServer, client: TidbClient): void {
   for (const documentId of BUSINESS_KNOWLEDGE_DOCUMENT_IDS) {
     const uri = buildBusinessKnowledgeDocumentUri(documentId);
@@ -23,7 +35,7 @@ export function registerBusinessKnowledgeResources(server: McpServer, client: Ti
       `business-knowledge-${documentId}`,
       uri,
       {
-        title: documentId === "startup-science" ? "起業の科学" : "Wisdom Evolution Marketing",
+        title: BUSINESS_KNOWLEDGE_DOCUMENT_TITLES[documentId],
         description: "Full source Markdown retained for audit and section regeneration.",
         mimeType: "text/markdown"
       },
@@ -127,15 +139,21 @@ export function registerBusinessKnowledgeResources(server: McpServer, client: Ti
 
 function decodeVariable(value: string | string[] | undefined, name: string): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new McpError(ErrorCode.InvalidParams, `Invalid business knowledge resource ${name}`);
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      `Invalid business knowledge resource ${name}`
+    );
   }
   try {
     return decodeURIComponent(value);
   } catch {
-    throw new McpError(ErrorCode.InvalidParams, `Invalid business knowledge resource ${name}`);
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      `Invalid business knowledge resource ${name}`
+    );
   }
 }
 
-function resourceNotFound(uri: string): McpError {
-  return new McpError(ErrorCode.InvalidParams, `Resource not found: ${uri}`);
+function resourceNotFound(uri: string): ResourceNotFoundError {
+  return new ResourceNotFoundError(uri);
 }

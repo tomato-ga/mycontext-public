@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mycontext-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-06",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "AUTHOR_STYLE_TITLE_PAGE_ID": "REPLACE_WITH_TITLE_PAGE_ID",
+    "AUTHOR_STYLE_BODY_PAGE_ID": "REPLACE_WITH_BODY_PAGE_ID"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "SYNC_QUEUE",
+        "queue": "mycontext-sync"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "mycontext-sync",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_concurrency": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "mycontext-sync-dead-letter"
+      },
+      {
+        "queue": "mycontext-sync-dead-letter",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_concurrency": 1,
+        "max_retries": 3
+      }
+    ]
+  }
+}

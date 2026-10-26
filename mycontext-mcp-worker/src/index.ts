@@ -1,6 +1,11 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpHandler } from "agents/mcp";
+import {
+  hostHeaderValidationResponse,
+  localhostAllowedHostnames,
+  McpServer,
+  originValidationResponse
+} from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
 import {
   MCP_RESOURCE,
   MCP_ROUTE,
@@ -12,18 +17,21 @@ import { ConfigError, loadConfig, type AppConfig, type Env } from "./config.js";
 import { jsonResponse, withSecurityHeaders } from "./http.js";
 import { inspectMcpRequest, withOpenAiToolDescriptors } from "./mcpCompatibility.js";
 import { defaultHandler } from "./oauth.js";
+import { withQueryDeadline } from "./queryDeadline.js";
 import { registerBusinessKnowledgeResources } from "./resources/businessKnowledge.js";
+import { registerEditorKnowledgeResources } from "./resources/editorKnowledge.js";
 import { registerAuthorStyleResources } from "./resources/authorStyle.js";
 import { registerMetaskillResources } from "./resources/metaskill.js";
 import { createTidbClient } from "./tidb.js";
 import { registerPublicTools } from "./tools/register.js";
 
-function createServer(config: AppConfig): McpServer {
-  const server = new McpServer({ name: "mycontext-mcp", version: "0.5.0" });
-  const client = createTidbClient(config.tidbDatabaseUrl);
+function createServer(config: AppConfig, signal?: AbortSignal): McpServer {
+  const server = new McpServer({ name: "mycontext-mcp", version: "0.8.0" });
+  const client = withQueryDeadline(createTidbClient(config.tidbDatabaseUrl), { signal });
 
-  registerPublicTools(server, client);
+  registerPublicTools(server, client, config.personalSynonyms);
   registerBusinessKnowledgeResources(server, client);
+  registerEditorKnowledgeResources(server, client);
   registerAuthorStyleResources(server, client);
   registerMetaskillResources(server, client);
 
@@ -45,10 +53,13 @@ const apiHandler = {
       throw error;
     }
 
-    const server = createServer(config);
-    const response = await createMcpHandler(server, {
+    const response = await createMcpHandler(() => createServer(config, request.signal), {
       route: MCP_ROUTE,
-      enableJsonResponse: true
+      responseMode: "json",
+      legacy: "stateless",
+      // Origin syntax is validated by mcpEndpointValidationResponse. OAuth,
+      // rather than a browser-origin allowlist, is the access-control boundary.
+      allowedOriginHostnames: "*"
     })(request, env, ctx);
     const finalResponse = withSecurityHeaders(
       await withOpenAiToolDescriptors(response, inspection.includesToolsList)
@@ -79,11 +90,14 @@ const oauthProvider = new OAuthProvider<Env>({
   disallowPublicClientRegistration: false,
   accessTokenTTL: 3600,
   refreshTokenTTL: 60 * 60 * 24 * 30,
-  clientRegistrationTTL: 60 * 60 * 24 * 90,
+  // ChatGPT reuses its DCR client for the life of the connection. Expiring the
+  // registration prevents reauthorization even after the user signs in again.
+  // Explicit undefined disables the provider's default 90-day registration TTL.
+  clientRegistrationTTL: undefined,
   resourceMetadata: {
     resource: MCP_RESOURCE,
     authorization_servers: [PUBLIC_ORIGIN],
-    scopes_supported: [MCP_SCOPE, OFFLINE_ACCESS_SCOPE],
+    scopes_supported: [MCP_SCOPE],
     bearer_methods_supported: ["header"],
     resource_name: "mycontext-mcp"
   },
@@ -92,9 +106,82 @@ const oauthProvider = new OAuthProvider<Env>({
   }
 });
 
+const publicHostname = new URL(PUBLIC_ORIGIN).hostname;
+const allowedMcpHostnames = [
+  ...localhostAllowedHostnames(),
+  publicHostname
+];
+
+function originSyntaxValidationResponse(request: Request): Response | undefined {
+  const origin = request.headers.get("origin");
+  if (origin === null || origin === "") {
+    return undefined;
+  }
+
+  let parsedOrigin: URL | undefined;
+  try {
+    parsedOrigin = new URL(origin);
+  } catch {
+    // The SDK helper below returns the protocol-compliant JSON-RPC 403 shape.
+  }
+
+  const isCanonicalHttpOrigin = parsedOrigin !== undefined
+    && (parsedOrigin.protocol === "https:" || parsedOrigin.protocol === "http:")
+    && parsedOrigin.hostname !== ""
+    && parsedOrigin.origin === origin;
+
+  return originValidationResponse(
+    request,
+    isCanonicalHttpOrigin && parsedOrigin !== undefined ? [parsedOrigin.hostname] : []
+  );
+}
+
+function withMcpCorsHeaders(request: Request, response: Response): Response {
+  if (new URL(request.url).pathname !== MCP_ROUTE) {
+    return response;
+  }
+  const origin = request.headers.get("origin");
+  if (origin === null || origin === "") {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", origin);
+  headers.set("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
+  headers.set(
+    "access-control-allow-headers",
+    "Authorization, Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name, Last-Event-ID, X-OpenAI-Session"
+  );
+  headers.set("access-control-expose-headers", "Mcp-Session-Id, WWW-Authenticate");
+  const vary = headers.get("vary");
+  if (vary === null || !vary.split(",").some((value) => value.trim().toLowerCase() === "origin")) {
+    headers.set("vary", vary === null ? "Origin" : `${vary}, Origin`);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function mcpEndpointValidationResponse(request: Request): Response | undefined {
+  if (new URL(request.url).pathname !== MCP_ROUTE) {
+    return undefined;
+  }
+
+  return hostHeaderValidationResponse(request, allowedMcpHostnames)
+    ?? originSyntaxValidationResponse(request);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return withSecurityHeaders(await oauthProvider.fetch(request, env, ctx));
+    const validationResponse = mcpEndpointValidationResponse(request);
+    if (validationResponse !== undefined) {
+      return withSecurityHeaders(validationResponse);
+    }
+    return withSecurityHeaders(
+      withMcpCorsHeaders(request, await oauthProvider.fetch(request, env, ctx))
+    );
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {

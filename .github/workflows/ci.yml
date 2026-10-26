@@ -9,6 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  public-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/check-public-safety.sh
+      - run: ./scripts/test-public-safety.sh
+
   mycontext-sync:
     runs-on: ubuntu-latest
     steps:
@@ -18,12 +25,11 @@ jobs:
           version: 11.7.0
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 22.22.3
           cache: pnpm
           cache-dependency-path: mycontext-sync/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: mycontext-sync
-      - run: ./scripts/check-public-safety.sh
       - run: pnpm run typecheck
         working-directory: mycontext-sync
       - run: pnpm test
@@ -40,15 +46,43 @@ jobs:
           version: 11.7.0
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 22.22.3
           cache: pnpm
           cache-dependency-path: mycontext-mcp-worker/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
         working-directory: mycontext-mcp-worker
-      - run: ./scripts/check-public-safety.sh
       - run: pnpm run typecheck
         working-directory: mycontext-mcp-worker
       - run: pnpm test
         working-directory: mycontext-mcp-worker
+      - run: pnpm run deploy:dry-run
+        working-directory: mycontext-mcp-worker
       - run: pnpm audit --audit-level moderate
         working-directory: mycontext-mcp-worker
+
+  mycontext-sync-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.3
+          cache: pnpm
+          cache-dependency-path: |
+            mycontext-sync/pnpm-lock.yaml
+            mycontext-sync-worker/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: mycontext-sync
+      - run: pnpm install --frozen-lockfile
+        working-directory: mycontext-sync-worker
+      - run: pnpm run typecheck
+        working-directory: mycontext-sync-worker
+      - run: pnpm test
+        working-directory: mycontext-sync-worker
+      - run: pnpm run deploy:dry-run
+        working-directory: mycontext-sync-worker
+      - run: pnpm audit --audit-level moderate
+        working-directory: mycontext-sync-worker

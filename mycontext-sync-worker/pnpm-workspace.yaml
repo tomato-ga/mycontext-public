@@ -1,0 +1,12 @@
+packages:
+  - "."
+
+overrides:
+  # Miniflare pins a vulnerable patch; keep the Undici 7 API and apply its fix.
+  # https://github.com/advisories/GHSA-xjj6-f33q-929c
+  "miniflare@5.20261019.1-beta>undici": "7.30.1"
+
+allowBuilds:
+  esbuild: true
+  sharp: false
+  workerd: true

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PersonalSynonymConfig } from "../src/searchQuery.js";
 import {
   buildDocumentReadModelSql,
   buildKeywordSearchParams,
@@ -9,6 +10,7 @@ import {
   escapeLikePattern,
   getBusinessKnowledgeSection,
   getDocument,
+  getEditorKnowledgeSection,
   listDocuments,
   searchContext,
   TopKValidationError,
@@ -71,6 +73,21 @@ describe("buildSearchSql", () => {
     expect(sql).not.toContain("VEC_COSINE_DISTANCE");
     expect(sql).not.toMatch(/\bDELETE\b/i);
   });
+
+  it("mirrors the business span match with an editor span match, excluding it from the whole-document fallback", () => {
+    const sql = buildSearchSql(5);
+
+    expect(sql).toContain("CONCAT('editor-knowledge:', documents.document_id)");
+    expect(sql).toContain("'editor_knowledge' AS source");
+    expect(sql).toContain("JOIN editor_knowledge_sections AS matched_sections");
+    expect(sql).toContain("FROM editor_knowledge_documents AS documents");
+    expect(sql).toContain("ranked_editor_matches");
+    expect(sql).toContain("FROM ranked_editor_matches");
+    // the whole-document fallback is skipped for ANY sectioned document (business or editor),
+    // not just business ones by name, so non-sectioned editor lessons are still found by it
+    expect(sql).toContain("WHERE documents.section_count IS NULL");
+    expect(sql).not.toContain("documents.source <> 'business_knowledge'");
+  });
 });
 
 describe("keyword fallback SQL", () => {
@@ -79,16 +96,24 @@ describe("keyword fallback SQL", () => {
     expect(sql).toContain("matched_sections.retrieval_text LIKE ?");
     expect(sql).toContain("documents.markdown LIKE ?");
     expect(sql).toContain("documents.title LIKE ?");
+    expect(sql).toContain("THEN 5 ELSE 0 END");
     expect(sql).toContain("ORDER BY search_score DESC");
     expect(sql).toContain("LIMIT 5");
     expect(sql).not.toContain("VEC_COSINE_DISTANCE");
     expect(buildKeywordSearchParams(["個人開発", "AIエージェント", "収益化"]))
-      .toHaveLength(24);
+      .toHaveLength(36);
   });
 
   it("rejects unbounded fallback term counts", () => {
     expect(() => buildKeywordSearchSql(0, 3)).toThrow(RangeError);
     expect(() => buildKeywordSearchSql(9, 3)).toThrow(RangeError);
+  });
+
+  it("also ranks editor knowledge sections and excludes them from the document fallback", () => {
+    const sql = buildKeywordSearchSql(3, 5);
+    expect(sql).toContain("FROM editor_knowledge_documents AS documents");
+    expect(sql).toContain("ranked_editor_matches");
+    expect(sql).toContain("WHERE documents.section_count IS NULL");
   });
 });
 
@@ -103,6 +128,20 @@ describe("unified document read model", () => {
     expect(sql).toContain("truncated AS source_truncated");
     expect(sql).toContain("FALSE AS source_truncated");
     expect(sql).toContain("JSON_ARRAY() AS unknown_block_ids");
+    // editor_knowledge now surfaces its own section_revision_sha256/section_count/
+    // search_span_count instead of always NULL, so sectioned planning documents (which have
+    // them) are distinguishable from the 8 non-sectioned lessons (which stay NULL)
+    const editorBranch = sql.slice(
+      sql.indexOf("FROM notion_pages"),
+      sql.indexOf("FROM business_knowledge_documents")
+    );
+    expect(editorBranch).toContain("FROM editor_knowledge_documents");
+    expect(editorBranch).not.toContain("NULL AS section_revision_sha256");
+    expect(editorBranch).not.toContain("NULL AS section_count");
+    expect(editorBranch).not.toContain("NULL AS search_span_count");
+    expect(editorBranch).toMatch(/\bsection_revision_sha256,/);
+    expect(editorBranch).toMatch(/\bsection_count,/);
+    expect(editorBranch).toMatch(/\bsearch_span_count,/);
   });
 
   it("maps both source rows to namespaced list output", async () => {
@@ -350,6 +389,9 @@ describe("business knowledge section retrieval", () => {
       "インタビュー",
       "%インタビュー%",
       "インタビュー",
+      "インタビュー",
+      "%インタビュー%",
+      "インタビュー",
       "%インタビュー%"
     ]);
   });
@@ -432,7 +474,154 @@ describe("business knowledge section retrieval", () => {
   });
 });
 
+describe("editor knowledge section retrieval", () => {
+  it("enriches a sectioned planning hit with an editor-knowledge resource URI and no business-only fields", async () => {
+    const client = clientReturning([{
+      document_id: "editor-knowledge:planning-catalog",
+      source: "editor_knowledge",
+      source_id: "planning-catalog",
+      title: "企画カタログ427",
+      markdown: "### No.1 ｜ 最初の企画\n\n企画1の本文。",
+      match_position: 1,
+      matched_span_position: 1,
+      matched_section_id: "no-001",
+      matched_section_title: "### No.1 ｜ 最初の企画",
+      matched_content_layer: "detail",
+      delivery_section_id: "no-001",
+      delivery_section_title: "### No.1 ｜ 最初の企画",
+      delivery_content_layer: "detail",
+      heading_path_json: ["企画カタログ427", "テーマ群A", "### No.1 ｜ 最初の企画"],
+      source_line_start: 6,
+      source_line_end: 8,
+      delivery_line_start: 6,
+      delivery_line_end: 8,
+      related_source_path: null,
+      freshness_class: "dated_example",
+      source_kind: null,
+      ingest_scope: null,
+      source_declared_at: null,
+      detail_available: null
+    }]);
+
+    await expect(searchContext(client, "企画1", 5)).resolves.toEqual([expect.objectContaining({
+      document_id: "editor-knowledge:planning-catalog",
+      source: "editor_knowledge",
+      delivery_section_id: "no-001",
+      matched_content_layer: "detail",
+      freshness_class: "dated_example",
+      resource_uri: "mycontext://editor-knowledge/planning-catalog/sections/no-001"
+    })]);
+    const hit = (await searchContext(client, "企画1", 5))[0];
+    expect(hit).not.toHaveProperty("source_kind");
+    expect(hit).not.toHaveProperty("ingest_scope");
+    expect(hit).not.toHaveProperty("source_declared_at");
+    expect(hit).not.toHaveProperty("detail_available");
+  });
+
+  it("reads only a section from the document's active section revision via getEditorKnowledgeSection", async () => {
+    const execute = vi.fn().mockResolvedValue([{
+      document_id: "planning-catalog",
+      section_id: "no-001",
+      title: "### No.1 ｜ 最初の企画",
+      heading_path_json: ["企画カタログ427", "テーマ群A", "### No.1 ｜ 最初の企画"],
+      content_layer: "detail",
+      section_markdown: "### No.1 ｜ 最初の企画\n\n企画1の本文。",
+      source_line_start: 6,
+      source_line_end: 8,
+      related_source_path: null,
+      freshness_class: "dated_example"
+    }]);
+    const client: TidbClient = { execute };
+
+    await expect(getEditorKnowledgeSection(client, "planning-catalog", "no-001"))
+      .resolves.toMatchObject({
+        document_id: "planning-catalog",
+        section_id: "no-001",
+        content_layer: "detail",
+        freshness_class: "dated_example",
+        resource_uri: "mycontext://editor-knowledge/planning-catalog/sections/no-001"
+      });
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringContaining("documents.section_revision_sha256 = sections.section_revision_sha256"),
+      ["planning-catalog", "no-001"]
+    );
+  });
+});
+
 describe("natural-language search fallback", () => {
+  // Entirely fictional stand-in for a PERSONAL_SYNONYMS secret, injected explicitly. No real
+  // names or personal facts belong in this file — see searchQuery.ts for how the real map is
+  // loaded from an env-provided secret at runtime.
+  const FICTIONAL_SYNONYMS: PersonalSynonymConfig = {
+    termAliases: {
+      "たろう": { aliases: ["山田太郎"], suppressOriginalTerm: true }
+    },
+    synonymGroups: [
+      ["たろう", "太郎", "山田太郎"],
+      ["収益化", "事業化", "マネタイズ", "収益"]
+    ]
+  };
+
+  it("routes the exact ChatGPT media-playbook prompt to one canonical document", async () => {
+    const execute = vi.fn().mockResolvedValueOnce([{
+      document_id: "editor-knowledge:media-design-playbook",
+      source: "editor_knowledge",
+      source_id: "media-design-playbook",
+      title: "メディア運営プレイブック",
+      markdown: "# メディア運営プレイブック\n\n全文",
+      markdown_sha256: "f".repeat(64),
+      source_truncated: 0,
+      unknown_block_ids: "[]",
+      last_synced_at: null
+    }]);
+    const client: TidbClient = { execute };
+
+    await expect(searchContext(
+      client,
+      "MCPこれのmedia playbook 読み込んでみて",
+      5
+    )).resolves.toEqual([expect.objectContaining({
+      document_id: "editor-knowledge:media-design-playbook",
+      title: "メディア運営プレイブック",
+      text: "# メディア運営プレイブック\n\n全文",
+      matched_terms: ["メディア運営プレイブック"],
+      score: 1000,
+      search_stage: "intent",
+      resource_uri: "mycontext://editor-knowledge/media-design-playbook"
+    })]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining("WHERE document_id = ?"), [
+      "editor-knowledge:media-design-playbook"
+    ]);
+  });
+
+  it("routes distinctive editor-training queries before generic ranking", async () => {
+    const execute = vi.fn().mockResolvedValueOnce([{
+      document_id: "editor-knowledge:editing-playbook-v2",
+      source: "editor_knowledge",
+      source_id: "editing-playbook-v2",
+      title: "編集プレイブック v2",
+      markdown: "# 編集プレイブック v2\n\n## 11 編集会議・運営・PDCA\n\n全文",
+      markdown_sha256: "editing-playbook-v2-sha",
+      source_truncated: false,
+      last_synced_at: "2026-10-23T02:21:30.587Z"
+    }]);
+    const client: TidbClient = { execute };
+
+    await expect(searchContext(
+      client,
+      "企画を検討する編集会議の進行方法を知りたい",
+      5
+    )).resolves.toEqual([expect.objectContaining({
+      document_id: "editor-knowledge:editing-playbook-v2",
+      matched_terms: ["編集プレイブック v2 11 編集会議・運営・PDCA"],
+      score: 1000,
+      search_stage: "intent",
+      resource_uri: "mycontext://editor-knowledge/editing-playbook-v2"
+    })]);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back from an absent full phrase to ranked keyword search", async () => {
     const execute = vi.fn()
       .mockResolvedValueOnce([])
@@ -440,7 +629,7 @@ describe("natural-language search fallback", () => {
         document_id: "notion:profile",
         source: "notion",
         source_id: "profile",
-        title: "個人開発とAIスキル",
+        title: "山田太郎キャリア・編集スキル",
         markdown: "現在はAIエージェント構築と個人開発に取り組み、事業化を目指している。",
         match_position: 1,
         search_score: "6"
@@ -449,15 +638,17 @@ describe("natural-language search fallback", () => {
 
     const hits = await searchContext(
       client,
-      "個人開発・AIエージェント活用・収益化目標に関する背景と強み",
-      3
+      "たろうの個人開発・AIエージェント活用・月20万円の収益化目標に関する背景と強み",
+      3,
+      FICTIONAL_SYNONYMS
     );
 
     expect(hits).toEqual([expect.objectContaining({
       document_id: "notion:profile",
       matched_terms: expect.arrayContaining([
         "個人開発",
-        "AIエージェント"
+        "AIエージェント",
+        "山田太郎"
       ]),
       score: 6,
       search_stage: "keywords"
@@ -481,12 +672,22 @@ describe("natural-language search fallback", () => {
       }]);
     const client: TidbClient = { execute };
 
-    const hits = await searchContext(client, "収益化について教えて", 3);
+    const hits = await searchContext(client, "収益化について教えて", 3, FICTIONAL_SYNONYMS);
     expect(hits[0]).toMatchObject({
       matched_terms: ["事業化"],
       search_stage: "synonyms"
     });
     expect(execute).toHaveBeenCalledTimes(3);
+  });
+
+  it("performs no synonym fallback when no config is injected (the safe default)", async () => {
+    const execute = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const client: TidbClient = { execute };
+
+    const hits = await searchContext(client, "収益化について教えて", 3);
+    expect(hits).toEqual([]);
+    // no third (synonym-fallback) query is issued, since expandSynonyms has nothing to expand
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 });
 

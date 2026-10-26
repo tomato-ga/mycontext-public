@@ -1,13 +1,12 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import { requireEnv } from "./config.js";
 import { sha256 } from "./hash.js";
 import { parseAuthorStyleRoutingManifest } from "./authorStyleRouting.js";
 import { AppError } from "./types.js";
 
-export const AUTHOR_STYLE_PARSER_VERSION = "author-style-parser-v1";
+export const TITLE_PARSER_VERSION = "author-style-parser-v2";
 export const AUTHOR_STYLE_SECTIONING_VERSION = "semantic-delivery-v1";
-export const AUTHOR_STYLE_ROUTING_VERSION = "single-context-pack-v1";
+export const TITLE_ROUTING_VERSION = "single-context-pack-v1";
+export const BODY_PARSER_VERSION = "author-style-parser-v4";
+export const BODY_ROUTING_VERSION = "single-context-pack-v3";
 
 const MEDIUMTEXT_MAX_BYTES = 16_777_215;
 
@@ -16,11 +15,10 @@ export type AuthorStyleDocumentId = typeof AUTHOR_STYLE_DOCUMENT_IDS[number];
 export type AuthorStyleScope = "title" | "body";
 export type AuthorStyleContentLayer = "runtime" | "profile" | "evaluation" | "evidence" | "ops";
 
-export interface AuthorStyleSource {
+export interface AuthorStyleDocumentDefinition {
   documentId: AuthorStyleDocumentId;
   authorKey: "example-author";
   styleScope: AuthorStyleScope;
-  relativePath: string;
 }
 
 export interface AuthorStyleSection {
@@ -72,6 +70,14 @@ export interface LoadedAuthorStyleDocument {
   sections: AuthorStyleSection[];
 }
 
+export interface AuthorStyleMarkdownInput {
+  source: AuthorStyleDocumentDefinition;
+  markdown: string;
+  sourcePathKey: string;
+  sourceMtimeMs: number;
+  sourceBytes?: number;
+}
+
 interface Heading {
   level: number;
   title: string;
@@ -89,18 +95,16 @@ interface BodyDefinition {
   priority: number;
 }
 
-export const AUTHOR_STYLE_SOURCES: readonly AuthorStyleSource[] = [
+export const AUTHOR_STYLE_DOCUMENTS: readonly AuthorStyleDocumentDefinition[] = [
   {
     documentId: "example-title-style",
     authorKey: "example-author",
-    styleScope: "title",
-    relativePath: "knowledge/example-title-reproduction-guide.md"
+    styleScope: "title"
   },
   {
     documentId: "example-body-style",
     authorKey: "example-author",
-    styleScope: "body",
-    relativePath: "knowledge/example-body-style-analysis.md"
+    styleScope: "body"
   }
 ];
 
@@ -116,62 +120,22 @@ const TITLE_MODE_KEYS = {
 } as const;
 
 const BODY_MODE_KEYS = {
-  "short-news": ["example-body/composition/short-news", "example-body/mode/classic-short-news"],
-  explanatory: ["example-body/composition/explanatory", "example-body/mode/modern-explanatory"],
-  review: ["example-body/composition/review", "example-body/mode/review"],
-  interview: ["example-body/composition/interview", "example-body/mode/interview"],
-  translation: ["example-body/composition/translation", "example-body/mode/translation"]
+  "short-news": ["example-body/composition/short-news"],
+  explanatory: ["example-body/composition/explanatory"],
+  review: ["example-body/composition/review"],
+  interview: ["example-body/composition/interview"],
+  translation: ["example-body/composition/translation"]
 } as const;
 
-export function authorStyleSourceRootFromEnv(): string {
-  const sourceRoot = requireEnv("AUTHOR_STYLE_SOURCE_ROOT");
-  if (!path.isAbsolute(sourceRoot)) {
+export function parseAuthorStyleMarkdown(
+  input: AuthorStyleMarkdownInput
+): LoadedAuthorStyleDocument {
+  const { source, markdown } = input;
+  if (!Number.isFinite(input.sourceMtimeMs) || input.sourceMtimeMs < 0) {
     throw new AppError(
-      "invalid_author_style_source_root",
-      "AUTHOR_STYLE_SOURCE_ROOT must be an absolute path",
+      "author_style_invalid_source_mtime",
+      `author style source mtime is invalid: ${source.documentId}`,
       3
-    );
-  }
-  return path.resolve(sourceRoot);
-}
-
-export async function loadAuthorStyleDocument(
-  sourceRoot: string,
-  source: AuthorStyleSource
-): Promise<LoadedAuthorStyleDocument> {
-  const absoluteRoot = path.resolve(sourceRoot);
-  const sourcePath = path.resolve(absoluteRoot, source.relativePath);
-  const relative = path.relative(absoluteRoot, sourcePath);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new AppError(
-      "author_style_path_escape",
-      `source path escapes configured root for ${source.documentId}`,
-      3
-    );
-  }
-
-  let bytes: Buffer;
-  let stat: Awaited<ReturnType<typeof fs.stat>>;
-  try {
-    [bytes, stat] = await Promise.all([fs.readFile(sourcePath), fs.stat(sourcePath)]);
-  } catch (error) {
-    throw new AppError(
-      "author_style_read_failed",
-      `failed to read author style source: ${source.documentId}`,
-      3,
-      error
-    );
-  }
-
-  let markdown: string;
-  try {
-    markdown = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "");
-  } catch (error) {
-    throw new AppError(
-      "author_style_invalid_utf8",
-      `author style source is not valid UTF-8: ${source.documentId}`,
-      3,
-      error
     );
   }
   if (markdown.trim().length === 0 || markdown.includes("\0")) {
@@ -189,6 +153,12 @@ export async function loadAuthorStyleDocument(
   const parsed = source.styleScope === "title"
     ? parseTitleStyle(displayName, lines, headings)
     : parseBodyStyle(displayName, lines, headings);
+  const parserVersion = source.styleScope === "body"
+    ? BODY_PARSER_VERSION
+    : TITLE_PARSER_VERSION;
+  const routingVersion = source.styleScope === "body"
+    ? BODY_ROUTING_VERSION
+    : TITLE_ROUTING_VERSION;
   const routingManifest = source.styleScope === "title"
     ? titleRoutingManifest()
     : bodyRoutingManifest();
@@ -198,9 +168,9 @@ export async function loadAuthorStyleDocument(
   const sourceMarkdownSha256 = sha256(markdown);
   const revisionSha256 = sha256([
     sourceMarkdownSha256,
-    AUTHOR_STYLE_PARSER_VERSION,
+    parserVersion,
     AUTHOR_STYLE_SECTIONING_VERSION,
-    AUTHOR_STYLE_ROUTING_VERSION,
+    routingVersion,
     JSON.stringify(routingManifest)
   ].join("\0"));
   const sections = parsed.map((section, index) => ({
@@ -220,16 +190,16 @@ export async function loadAuthorStyleDocument(
     authorKey: source.authorKey,
     styleScope: source.styleScope,
     displayName,
-    sourcePathKey: source.relativePath,
+    sourcePathKey: input.sourcePathKey,
     sourceMarkdown: markdown,
     sourceMarkdownSha256,
-    sourceBytes: bytes.byteLength,
+    sourceBytes: input.sourceBytes ?? new TextEncoder().encode(markdown).byteLength,
     sourceLineCount: lines.length,
-    sourceMtimeMs: Math.trunc(stat.mtimeMs),
+    sourceMtimeMs: Math.trunc(input.sourceMtimeMs),
     revisionSha256,
-    parserVersion: AUTHOR_STYLE_PARSER_VERSION,
+    parserVersion,
     sectioningVersion: AUTHOR_STYLE_SECTIONING_VERSION,
-    routingVersion: AUTHOR_STYLE_ROUTING_VERSION,
+    routingVersion,
     routingManifest,
     outline: {
       headings: headings.map((heading) => ({
@@ -333,8 +303,55 @@ function parseTitleStyle(documentTitle: string, lines: string[], headings: Headi
   return sections;
 }
 
-function parseBodyStyle(documentTitle: string, lines: string[], headings: Heading[]): ParsedSection[] {
+function parseBodyStyle(
+  documentTitle: string,
+  lines: string[],
+  headings: Heading[]
+): ParsedSection[] {
   const h2s = headings.filter((heading) => heading.level === 2);
+  const expectedTitles = [
+    "1. 基本リズム",
+    "2. 文体・語尾",
+    "3. 会話性と人称",
+    "4. 接続と論理の運び方",
+    "5. 不確実性・評価・感情",
+    "6. 疑問・感嘆・記号",
+    "7. 冒頭の作り方",
+    "8. 本論の組み立て",
+    "9. 結びの作り方",
+    "10. 読者への距離",
+    "11. 公開本文の構造要素",
+    "12. 本文生成のスタイル契約",
+    "13. 本文評価チェックリスト",
+    "14. 長文記事の特長"
+  ];
+  const actualTitles = h2s.map((heading) => heading.title);
+  if (JSON.stringify(actualTitles) !== JSON.stringify(expectedTitles)) {
+    throw new AppError(
+      "author_style_body_outline_mismatch",
+      `example-body-style H2 outline changed; expected ${expectedTitles.join(", ")}, got ${actualTitles.join(", ")}`,
+      3
+    );
+  }
+
+  const definitions: Record<number, BodyDefinition> = {
+    1: { contextKey: "example-body/core/rhythm", contentLayer: "runtime", priority: 95 },
+    2: { contextKey: "example-body/core/tone", contentLayer: "runtime", priority: 95 },
+    3: { contextKey: "example-body/core/person", contentLayer: "runtime", priority: 90 },
+    4: { contextKey: "example-body/core/logic", contentLayer: "runtime", priority: 95 },
+    5: { contextKey: "example-body/core/certainty-emotion", contentLayer: "runtime", priority: 95 },
+    6: { contextKey: "example-body/core/notation", contentLayer: "runtime", priority: 90 },
+    7: { contextKey: "example-body/structure/opening", contentLayer: "runtime", priority: 95 },
+    9: { contextKey: "example-body/structure/closing", contentLayer: "runtime", priority: 95 },
+    10: { contextKey: "example-body/reader-distance", contentLayer: "runtime", priority: 85 },
+    11: {
+      contextKey: "example-body/evidence/structure-elements",
+      contentLayer: "evidence",
+      priority: 35
+    },
+    12: { contextKey: "example-body/contract", contentLayer: "runtime", priority: 100 },
+    13: { contextKey: "example-body/evaluator", contentLayer: "evaluation", priority: 100 }
+  };
   const sections: ParsedSection[] = [];
 
   for (let index = 0; index < h2s.length; index += 1) {
@@ -345,84 +362,257 @@ function parseBodyStyle(documentTitle: string, lines: string[], headings: Headin
       return heading.level === 3 && heading.line > h2.line && heading.line < nextLine;
     });
 
-    if (chapter === 10 || chapter === 18 || chapter === 22) {
-      parseBodyChildDeliveries(documentTitle, lines, h2, nextLine, children, chapter, sections);
+    if (chapter === 8) {
+      parseBodyCompositionDeliveries(
+        documentTitle,
+        lines,
+        h2,
+        nextLine,
+        children,
+        sections
+      );
+      continue;
+    }
+    if (chapter === 14) {
+      parseBodyLongformDeliveries(
+        documentTitle,
+        lines,
+        h2,
+        nextLine,
+        children,
+        sections
+      );
       continue;
     }
 
-    const definition = bodyH2Definition(h2.title, chapter);
-    const sectionId = sectionIdFromContextKey(definition.contextKey);
-    const deliveryMarkdown = sliceLines(lines, h2.line, nextLine - 1);
-    const directEnd = children[0]?.line ? children[0].line - 1 : nextLine - 1;
-    sections.push(buildParsedSection({
-      sectionId,
-      contextKey: definition.contextKey,
-      parentSectionId: null,
-      deliverySectionId: sectionId,
-      sectionType: "delivery",
-      contentLayer: definition.contentLayer,
-      contextPriority: definition.priority,
-      headingLevel: 2,
-      title: h2.title,
-      headingPath: [documentTitle, h2.title],
-      aliases: [h2.title, definition.contextKey],
-      sourceLineStart: h2.line,
-      sourceLineEnd: nextLine - 1,
-      directMarkdown: sliceLines(lines, h2.line, directEnd),
-      deliveryMarkdown,
-      isSearchable: true
-    }));
-
-    const usedChildIds = new Set<string>();
-    for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
-      const child = children[childIndex];
-      const childNextLine = children[childIndex + 1]?.line ?? nextLine;
-      const childMarkdown = sliceLines(lines, child.line, childNextLine - 1);
-      const childId = uniqueChildId(sectionId, child.title, usedChildIds);
-      sections.push(buildParsedSection({
-        sectionId: childId,
-        contextKey: null,
-        parentSectionId: sectionId,
-        deliverySectionId: sectionId,
-        sectionType: "search_span",
-        contentLayer: definition.contentLayer,
-        contextPriority: definition.priority,
-        headingLevel: 3,
-        title: child.title,
-        headingPath: [documentTitle, h2.title, child.title],
-        aliases: [child.title],
-        sourceLineStart: child.line,
-        sourceLineEnd: childNextLine - 1,
-        directMarkdown: childMarkdown,
-        deliveryMarkdown,
-        isSearchable: true
-      }));
+    const definition = chapter === null ? undefined : definitions[chapter];
+    if (definition === undefined) {
+      throw new AppError(
+        "author_style_body_heading_unmapped",
+        `unmapped body H2 heading: ${h2.title}`,
+        3
+      );
     }
+    appendBodyDeliveryWithSearchSpans({
+      documentTitle,
+      lines,
+      h2,
+      nextLine,
+      children,
+      definition,
+      sections
+    });
   }
-
   return sections;
 }
 
-function parseBodyChildDeliveries(
+function appendBodyDeliveryWithSearchSpans(input: {
+  documentTitle: string;
+  lines: string[];
+  h2: Heading;
+  nextLine: number;
+  children: Heading[];
+  definition: BodyDefinition;
+  sections: ParsedSection[];
+}): void {
+  const { documentTitle, lines, h2, nextLine, children, definition, sections } = input;
+  const sectionId = sectionIdFromContextKey(definition.contextKey);
+  const deliveryMarkdown = sliceLines(lines, h2.line, nextLine - 1);
+  const directEnd = children[0]?.line ? children[0].line - 1 : nextLine - 1;
+  sections.push(buildParsedSection({
+    sectionId,
+    contextKey: definition.contextKey,
+    parentSectionId: null,
+    deliverySectionId: sectionId,
+    sectionType: "delivery",
+    contentLayer: definition.contentLayer,
+    contextPriority: definition.priority,
+    headingLevel: 2,
+    title: h2.title,
+    headingPath: [documentTitle, h2.title],
+    aliases: [h2.title, definition.contextKey],
+    sourceLineStart: h2.line,
+    sourceLineEnd: nextLine - 1,
+    directMarkdown: sliceLines(lines, h2.line, directEnd),
+    deliveryMarkdown,
+    isSearchable: true
+  }));
+
+  const usedChildIds = new Set<string>();
+  for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
+    const child = children[childIndex];
+    const childNextLine = children[childIndex + 1]?.line ?? nextLine;
+    const childMarkdown = sliceLines(lines, child.line, childNextLine - 1);
+    const childId = uniqueChildId(sectionId, child.title, usedChildIds);
+    sections.push(buildParsedSection({
+      sectionId: childId,
+      contextKey: null,
+      parentSectionId: sectionId,
+      deliverySectionId: sectionId,
+      sectionType: "search_span",
+      contentLayer: definition.contentLayer,
+      contextPriority: definition.priority,
+      headingLevel: 3,
+      title: child.title,
+      headingPath: [documentTitle, h2.title, child.title],
+      aliases: [child.title],
+      sourceLineStart: child.line,
+      sourceLineEnd: childNextLine - 1,
+      directMarkdown: childMarkdown,
+      deliveryMarkdown,
+      isSearchable: true
+    }));
+  }
+}
+
+function parseBodyCompositionDeliveries(
   documentTitle: string,
   lines: string[],
   h2: Heading,
   nextLine: number,
   children: Heading[],
-  chapter: number,
   sections: ParsedSection[]
 ): void {
-  if (children.length === 0) {
-    throw new AppError(
-      "author_style_body_expected_children",
-      `expected H3 delivery sections under ${h2.title}`,
-      3
-    );
-  }
+  const expectedTitles = [
+    "8.1 標準記事",
+    "8.2 レビュー・体験",
+    "8.3 インタビュー・長文",
+    "8.4 翻訳・紹介"
+  ];
+  assertChildOutline("compact composition", children, expectedTitles);
+  const definitions = [
+    [
+      { contextKey: "example-body/composition/short-news", contentLayer: "runtime", priority: 90 },
+      { contextKey: "example-body/composition/explanatory", contentLayer: "runtime", priority: 90 }
+    ],
+    [{ contextKey: "example-body/composition/review", contentLayer: "runtime", priority: 90 }],
+    [{ contextKey: "example-body/composition/interview", contentLayer: "runtime", priority: 90 }],
+    [{ contextKey: "example-body/composition/translation", contentLayer: "runtime", priority: 90 }]
+  ] satisfies BodyDefinition[][];
+
   for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
     const child = children[childIndex];
     const childNextLine = children[childIndex + 1]?.line ?? nextLine;
-    const definition = bodyChildDefinition(chapter, child.title, childIndex);
+    const markdown = sliceLines(lines, child.line, childNextLine - 1);
+    for (const definition of definitions[childIndex] ?? []) {
+      const sectionId = sectionIdFromContextKey(definition.contextKey);
+      sections.push(buildParsedSection({
+        sectionId,
+        contextKey: definition.contextKey,
+        parentSectionId: null,
+        deliverySectionId: sectionId,
+        sectionType: "delivery",
+        contentLayer: definition.contentLayer,
+        contextPriority: definition.priority,
+        headingLevel: 3,
+        title: child.title,
+        headingPath: [documentTitle, h2.title, child.title],
+        aliases: [child.title, definition.contextKey],
+        sourceLineStart: child.line,
+        sourceLineEnd: childNextLine - 1,
+        directMarkdown: markdown,
+        deliveryMarkdown: markdown,
+        isSearchable: true
+      }));
+    }
+  }
+}
+
+function parseBodyLongformDeliveries(
+  documentTitle: string,
+  lines: string[],
+  h2: Heading,
+  nextLine: number,
+  children: Heading[],
+  sections: ParsedSection[]
+): void {
+  const expectedTitles = [
+    "14.1 長文の基本方針",
+    "14.2 伝聞と自分の判断を分ける",
+    "14.3 長文の熱量は、問いと検討で作る",
+    "14.4 見出しは「話題名」ではなく「読者の判断軸」にする",
+    "14.5 長文記事専用のスタイル契約",
+    "14.6 長文で避けること"
+  ];
+  assertChildOutline("compact longform", children, expectedTitles);
+
+  const contract = children[4];
+  const antiPatterns = children[5];
+  if (contract === undefined || antiPatterns === undefined) {
+    throw new AppError(
+      "author_style_compact_body_longform_missing",
+      "compact longform contract or anti-patterns section is missing",
+      3
+    );
+  }
+
+  const guidanceDefinition: BodyDefinition = {
+    contextKey: "example-body/longform/guidance",
+    contentLayer: "runtime",
+    priority: 90
+  };
+  const guidanceSectionId = sectionIdFromContextKey(guidanceDefinition.contextKey);
+  const guidanceMarkdown = sliceLines(lines, h2.line, contract.line - 1);
+  sections.push(buildParsedSection({
+    sectionId: guidanceSectionId,
+    contextKey: guidanceDefinition.contextKey,
+    parentSectionId: null,
+    deliverySectionId: guidanceSectionId,
+    sectionType: "delivery",
+    contentLayer: guidanceDefinition.contentLayer,
+    contextPriority: guidanceDefinition.priority,
+    headingLevel: 2,
+    title: h2.title,
+    headingPath: [documentTitle, h2.title],
+    aliases: [h2.title, guidanceDefinition.contextKey],
+    sourceLineStart: h2.line,
+    sourceLineEnd: contract.line - 1,
+    directMarkdown: sliceLines(lines, h2.line, children[0]?.line ? children[0].line - 1 : contract.line - 1),
+    deliveryMarkdown: guidanceMarkdown,
+    isSearchable: true
+  }));
+
+  const usedChildIds = new Set<string>();
+  for (let childIndex = 0; childIndex < 4; childIndex += 1) {
+    const child = children[childIndex];
+    if (child === undefined) continue;
+    const childNextLine = children[childIndex + 1]?.line ?? contract.line;
+    const childId = uniqueChildId(guidanceSectionId, child.title, usedChildIds);
+    sections.push(buildParsedSection({
+      sectionId: childId,
+      contextKey: null,
+      parentSectionId: guidanceSectionId,
+      deliverySectionId: guidanceSectionId,
+      sectionType: "search_span",
+      contentLayer: guidanceDefinition.contentLayer,
+      contextPriority: guidanceDefinition.priority,
+      headingLevel: 3,
+      title: child.title,
+      headingPath: [documentTitle, h2.title, child.title],
+      aliases: [child.title],
+      sourceLineStart: child.line,
+      sourceLineEnd: childNextLine - 1,
+      directMarkdown: sliceLines(lines, child.line, childNextLine - 1),
+      deliveryMarkdown: guidanceMarkdown,
+      isSearchable: true
+    }));
+  }
+
+  for (const [child, definition] of [
+    [
+      contract,
+      { contextKey: "example-body/longform/contract", contentLayer: "runtime", priority: 95 }
+    ],
+    [
+      antiPatterns,
+      {
+        contextKey: "example-body/longform/anti-patterns",
+        contentLayer: "evaluation",
+        priority: 95
+      }
+    ]
+  ] satisfies Array<[Heading, BodyDefinition]>) {
+    const childNextLine = child === contract ? antiPatterns.line : nextLine;
     const sectionId = sectionIdFromContextKey(definition.contextKey);
     const markdown = sliceLines(lines, child.line, childNextLine - 1);
     sections.push(buildParsedSection({
@@ -446,107 +636,20 @@ function parseBodyChildDeliveries(
   }
 }
 
-function bodyH2Definition(title: string, chapter: number | null): BodyDefinition {
-  if (title === "Executive Summary") {
-    return { contextKey: "example-body/bootstrap", contentLayer: "runtime", priority: 70 };
-  }
-  const definitions: Record<number, BodyDefinition> = {
-    1: { contextKey: "example-body/evidence/data-quality", contentLayer: "evidence", priority: 30 },
-    2: { contextKey: "example-body/evidence/basic-dimensions", contentLayer: "evidence", priority: 30 },
-    3: { contextKey: "example-body/core/rhythm", contentLayer: "runtime", priority: 95 },
-    4: { contextKey: "example-body/core/tone", contentLayer: "runtime", priority: 95 },
-    5: { contextKey: "example-body/core/person", contentLayer: "runtime", priority: 90 },
-    6: { contextKey: "example-body/core/logic", contentLayer: "runtime", priority: 95 },
-    7: { contextKey: "example-body/core/certainty-emotion", contentLayer: "runtime", priority: 95 },
-    8: { contextKey: "example-body/core/notation", contentLayer: "runtime", priority: 90 },
-    9: { contextKey: "example-body/structure/opening", contentLayer: "runtime", priority: 95 },
-    11: { contextKey: "example-body/structure/closing", contentLayer: "runtime", priority: 95 },
-    12: { contextKey: "example-body/flow", contentLayer: "runtime", priority: 90 },
-    13: { contextKey: "example-body/reader-distance", contentLayer: "runtime", priority: 85 },
-    14: { contextKey: "example-body/evidence/structure-elements", contentLayer: "evidence", priority: 35 },
-    15: { contextKey: "example-body/profile/media", contentLayer: "profile", priority: 70 },
-    16: { contextKey: "example-body/profile/era", contentLayer: "profile", priority: 70 },
-    17: { contextKey: "example-body/contract", contentLayer: "runtime", priority: 100 },
-    19: { contextKey: "example-body/evaluator", contentLayer: "evaluation", priority: 100 },
-    20: { contextKey: "example-body/evidence/limitations", contentLayer: "evidence", priority: 20 },
-    21: { contextKey: "example-body/ops/references", contentLayer: "ops", priority: 20 }
-  };
-  const definition = chapter === null ? undefined : definitions[chapter];
-  if (definition === undefined) {
+function assertChildOutline(label: string, children: Heading[], expectedTitles: string[]): void {
+  const actualTitles = children.map((child) => child.title);
+  if (JSON.stringify(actualTitles) !== JSON.stringify(expectedTitles)) {
     throw new AppError(
-      "author_style_body_heading_unmapped",
-      `unmapped body H2 heading: ${title}`,
+      "author_style_body_child_outline_mismatch",
+      `${label} H3 outline changed; expected ${expectedTitles.join(", ")}, got ${actualTitles.join(", ")}`,
       3
     );
   }
-  return definition;
-}
-
-function bodyChildDefinition(chapter: number, title: string, index: number): BodyDefinition {
-  if (chapter === 10) {
-    const definitions = [
-      { contextKey: "example-body/composition/short-news", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/composition/explanatory", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/composition/review", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/composition/interview", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/composition/translation", contentLayer: "runtime", priority: 90 }
-    ] satisfies BodyDefinition[];
-    return requireIndexedDefinition(definitions, index, title);
-  }
-  if (chapter === 18) {
-    const definitions = [
-      { contextKey: "example-body/mode/classic-short-news", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/mode/modern-explanatory", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/mode/review", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/mode/interview", contentLayer: "runtime", priority: 90 },
-      { contextKey: "example-body/mode/translation", contentLayer: "runtime", priority: 90 }
-    ] satisfies BodyDefinition[];
-    return requireIndexedDefinition(definitions, index, title);
-  }
-  const longformNumber = /^21\.(\d+)\s/.exec(title)?.[1];
-  if (longformNumber === undefined) {
-    throw new AppError(
-      "author_style_body_longform_heading_unmapped",
-      `unmapped longform heading: ${title}`,
-      3
-    );
-  }
-  if (longformNumber === "9") {
-    return { contextKey: "example-body/longform/contract", contentLayer: "runtime", priority: 90 };
-  }
-  if (longformNumber === "10") {
-    return {
-      contextKey: "example-body/longform/anti-patterns",
-      contentLayer: "evaluation",
-      priority: 90
-    };
-  }
-  return {
-    contextKey: `example-body/evidence/longform-${longformNumber.padStart(2, "0")}`,
-    contentLayer: "evidence",
-    priority: longformNumber === "11" ? 20 : 35
-  };
-}
-
-function requireIndexedDefinition(
-  definitions: readonly BodyDefinition[],
-  index: number,
-  title: string
-): BodyDefinition {
-  const definition = definitions[index];
-  if (definition === undefined || index >= definitions.length) {
-    throw new AppError(
-      "author_style_body_child_count_mismatch",
-      `unexpected body child heading: ${title}`,
-      3
-    );
-  }
-  return definition;
 }
 
 function titleRoutingManifest(): Record<string, unknown> {
   return {
-    schemaVersion: AUTHOR_STYLE_ROUTING_VERSION,
+    schemaVersion: TITLE_ROUTING_VERSION,
     selectorSchema: {
       operations: ["generate", "evaluate"],
       modes: Object.keys(TITLE_MODE_KEYS),
@@ -580,7 +683,7 @@ function titleRoutingManifest(): Record<string, unknown> {
 
 function bodyRoutingManifest(): Record<string, unknown> {
   return {
-    schemaVersion: AUTHOR_STYLE_ROUTING_VERSION,
+    schemaVersion: BODY_ROUTING_VERSION,
     selectorSchema: {
       operations: ["generate", "edit-voice", "edit-structure", "evaluate"],
       modes: Object.keys(BODY_MODE_KEYS),
@@ -618,7 +721,6 @@ function bodyRoutingManifest(): Record<string, unknown> {
         base: [
           "example-body/contract",
           "example-body/structure/opening",
-          "example-body/flow",
           "example-body/structure/closing",
           "example-body/evaluator"
         ]
@@ -629,15 +731,19 @@ function bodyRoutingManifest(): Record<string, unknown> {
     },
     lengthBandMap: {
       le600: [],
-      "601-1000": ["example-body/longform/contract"],
-      "1001-2000": ["example-body/longform/contract"],
-      "2001plus": ["example-body/longform/contract", "example-body/longform/anti-patterns"]
+      "601-1000": ["example-body/longform/guidance", "example-body/longform/contract"],
+      "1001-2000": ["example-body/longform/guidance", "example-body/longform/contract"],
+      "2001plus": [
+        "example-body/longform/guidance",
+        "example-body/longform/contract",
+        "example-body/longform/anti-patterns"
+      ]
     },
     profileMap: {
       neutral: [],
-      classic: ["example-body/profile/era"],
-      modern: ["example-body/profile/era"],
-      "media-specific": ["example-body/profile/media"]
+      classic: [],
+      modern: [],
+      "media-specific": []
     },
     maxContextChars: 45_000,
     overflowPolicy: "error_no_truncation"
@@ -773,7 +879,7 @@ function bodyChapterNumber(title: string): number | null {
 }
 
 function sectionIdFromContextKey(contextKey: string): string {
-  return contextKey.replace(/^[^/]+\//, "").replace(/\//g, "--");
+  return contextKey.replace(/^example-(?:title|body)\//, "").replace(/\//g, "--");
 }
 
 function uniqueChildId(parentId: string, title: string, used: Set<string>): string {

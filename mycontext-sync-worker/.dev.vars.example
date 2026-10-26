@@ -1,0 +1,6 @@
+TIDB_DATABASE_URL=mysql://<writer-user>:<password>@<host>/<database>
+NOTION_API_TOKEN=<notion-integration-token>
+NOTION_DATA_SOURCE_ID=<documents-data-source-id>
+NOTION_WEBHOOK_BOOTSTRAP_SECRET=<random-bootstrap-secret>
+# Set only after the initial webhook verification request.
+# NOTION_WEBHOOK_VERIFICATION_TOKEN=<verification-token-after-subscription-setup>

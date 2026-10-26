@@ -3,7 +3,10 @@
   "name": "mycontext-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-06",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat",
+    "enable_request_signal"
+  ],
   "observability": {
     "logs": {
       "enabled": true,
@@ -26,6 +29,13 @@
     }
   ],
   "triggers": {
-    "crons": ["0 0 * * *"]
+    "crons": [
+      "0 0 * * *"
+    ]
+  },
+  "workers_dev": true,
+  "preview_urls": false,
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
   }
 }

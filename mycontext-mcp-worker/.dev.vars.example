@@ -2,3 +2,7 @@ TIDB_DATABASE_URL=mysql://<user>:<password>@<host>/<database>
 GITHUB_CLIENT_ID=<github-oauth-app-client-id>
 GITHUB_CLIENT_SECRET=<github-oauth-app-client-secret>
 GITHUB_ALLOWED_USER_ID=<numeric-github-user-id>
+
+# Optional. JSON-encoded search aliases. Keep real aliases in local secrets.
+# Omit for no synonym expansion.
+PERSONAL_SYNONYMS={"termAliases":{"<nickname>":{"aliases":["<full name>"],"suppressOriginalTerm":true}},"synonymGroups":[["<term>","<synonym>"]]}

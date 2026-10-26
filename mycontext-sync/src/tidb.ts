@@ -49,7 +49,24 @@ export interface EditorKnowledgeDocumentRow extends RowDataPacket {
   title: string;
   markdown: string;
   markdown_sha256: string;
+  section_revision_sha256: string | null;
+  section_count: number | null;
+  search_span_count: number | null;
   last_synced_at: Date | string;
+}
+
+export interface EditorKnowledgeSchemaGuardColumnConflict {
+  column: string;
+  expectedDataType: string;
+  actualDataType: string;
+}
+
+export interface EditorKnowledgeSchemaGuardResult {
+  documentsTableExists: boolean;
+  sectionsTableAlreadyExists: boolean;
+  preexistingDocumentRowCount: number;
+  preexistingSectionColumns: string[];
+  columnTypeConflicts: EditorKnowledgeSchemaGuardColumnConflict[];
 }
 
 export interface BusinessKnowledgeDocumentRow extends RowDataPacket {
@@ -104,14 +121,7 @@ export interface AuthorStyleDocumentRow extends RowDataPacket {
   style_scope: string;
   display_name: string;
   source_path_key: string;
-  active_revision_sha256: string | null;
-  status: string;
-  last_synced_at: Date | string | null;
-}
-
-export interface AuthorStyleRevisionRow extends RowDataPacket {
-  document_id: string;
-  revision_sha256: string;
+  context_sha256: string;
   source_markdown: string;
   source_markdown_sha256: string;
   source_bytes: number | string;
@@ -125,12 +135,12 @@ export interface AuthorStyleRevisionRow extends RowDataPacket {
   section_count: number | string;
   delivery_section_count: number | string;
   search_span_count: number | string;
-  synced_at: Date | string;
+  status: string;
+  last_synced_at: Date | string | null;
 }
 
 export interface AuthorStyleSectionRow extends RowDataPacket {
   document_id: string;
-  revision_sha256: string;
   section_id: string;
   context_key: string | null;
   parent_section_id: string | null;
@@ -152,6 +162,33 @@ export interface AuthorStyleSectionRow extends RowDataPacket {
   retrieval_text: string;
   content_sha256: string;
   is_searchable: number | boolean;
+}
+
+export interface SyncStateLogRow extends RowDataPacket {
+  run_id: string;
+  sequence_no: number | string;
+  event_id: string;
+  delivery_attempt: number | string;
+  page_id: string;
+  document_id: string | null;
+  category: string | null;
+  state: string;
+  workflow_status: string | null;
+  validation_status: string;
+  input_fingerprint: string | null;
+  source_markdown_sha256: string | null;
+  active_revision_before: string | null;
+  candidate_revision_sha256: string | null;
+  parser_version: string | null;
+  sectioning_version: string | null;
+  routing_version: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  retryable: number | boolean | null;
+  next_action: string;
+  details_json: string | Record<string, unknown>;
+  triggered_at: Date | string;
+  recorded_at: Date | string;
 }
 
 export interface MetaskillDocumentRow extends RowDataPacket {
@@ -210,6 +247,68 @@ export interface MetaskillSectionRow extends RowDataPacket {
   is_searchable: number | boolean;
 }
 
+/**
+ * Splits a schema.sql file's contents into individually executable statements, the way
+ * applySchema does. Schema files are naively split on ";", so a "--" line comment containing
+ * a semicolon (e.g. "-- ...; each column ...") used to be sent to the server as its own
+ * broken statement fragment and fail. Whole-line "--" comments are stripped first to remove
+ * that trap; this does not attempt to strip inline trailing comments after real SQL, since no
+ * schema file in this codebase uses those and stripping them safely would require a real SQL
+ * tokenizer (to avoid also stripping "--" that legitimately appears inside a string literal).
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const withoutCommentLines = sql
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("--"))
+    .join("\n");
+  return withoutCommentLines
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+}
+
+const EXPECTED_EDITOR_SECTION_COLUMN_DATA_TYPES: Record<string, string> = {
+  section_revision_sha256: "char",
+  section_count: "int",
+  search_span_count: "int"
+};
+
+/**
+ * Pure decision core for inspectEditorKnowledgeSchemaGuard, kept separate from the
+ * information_schema queries so the guard's logic can be unit tested without a real
+ * database connection.
+ */
+export function computeEditorKnowledgeSchemaGuardResult(
+  existingTableNames: string[],
+  documentRowCount: number,
+  documentColumnRows: Array<{ COLUMN_NAME: string; DATA_TYPE: string }>
+): EditorKnowledgeSchemaGuardResult {
+  const documentsTableExists = existingTableNames.includes("editor_knowledge_documents");
+  const sectionsTableAlreadyExists = existingTableNames.includes("editor_knowledge_sections");
+
+  const preexistingSectionColumns: string[] = [];
+  const columnTypeConflicts: EditorKnowledgeSchemaGuardColumnConflict[] = [];
+  for (const row of documentColumnRows) {
+    preexistingSectionColumns.push(row.COLUMN_NAME);
+    const expectedDataType = EXPECTED_EDITOR_SECTION_COLUMN_DATA_TYPES[row.COLUMN_NAME];
+    if (expectedDataType !== undefined && row.DATA_TYPE.toLowerCase() !== expectedDataType) {
+      columnTypeConflicts.push({
+        column: row.COLUMN_NAME,
+        expectedDataType,
+        actualDataType: row.DATA_TYPE
+      });
+    }
+  }
+
+  return {
+    documentsTableExists,
+    sectionsTableAlreadyExists,
+    preexistingDocumentRowCount: documentsTableExists ? documentRowCount : 0,
+    preexistingSectionColumns,
+    columnTypeConflicts
+  };
+}
+
 export class TidbClient {
   private readonly pool: Pool;
 
@@ -232,10 +331,7 @@ export class TidbClient {
 
   async applySchema(schemaPath: string): Promise<number> {
     const sql = await fsPromises.readFile(path.resolve(schemaPath), "utf8");
-    const statements = sql
-      .split(";")
-      .map((statement) => statement.trim())
-      .filter((statement) => statement.length > 0);
+    const statements = splitSqlStatements(sql);
     const connection = await this.pool.getConnection();
     try {
       for (const statement of statements) {
@@ -253,6 +349,33 @@ export class TidbClient {
       [pageId]
     );
     return rows[0]?.markdown_sha256 ?? null;
+  }
+
+  async getSyncStateLog(documentId?: string): Promise<SyncStateLogRow[]> {
+    const where = documentId === undefined
+      ? ""
+      : `WHERE run_id IN (
+           SELECT DISTINCT run_id
+           FROM context_sync_state_log
+           WHERE document_id = ?
+         )`;
+    const params = documentId === undefined ? [] : [documentId];
+    const [rows] = await this.pool.execute<SyncStateLogRow[]>(
+      `SELECT run_id, sequence_no, event_id, delivery_attempt, page_id,
+              document_id, category, state, workflow_status, validation_status,
+              input_fingerprint, source_markdown_sha256, active_revision_before,
+              candidate_revision_sha256, parser_version, sectioning_version,
+              routing_version, error_code, error_message, retryable, next_action,
+              details_json,
+              CONCAT(DATE_FORMAT(triggered_at, '%Y-%m-%dT%H:%i:%s.%f'), 'Z') AS triggered_at,
+              CONCAT(DATE_FORMAT(recorded_at, '%Y-%m-%dT%H:%i:%s.%f'), 'Z') AS recorded_at
+       FROM context_sync_state_log
+       ${where}
+       ORDER BY recorded_at DESC, run_id DESC, sequence_no DESC
+       LIMIT 50`,
+      params
+    );
+    return rows;
   }
 
   async upsertPage(input: {
@@ -314,13 +437,59 @@ export class TidbClient {
 
   async getEditorKnowledgeDocument(documentId: string): Promise<EditorKnowledgeDocumentRow | null> {
     const [rows] = await this.pool.execute<EditorKnowledgeDocumentRow[]>(
-      `SELECT document_id, title, markdown, markdown_sha256, last_synced_at
+      `SELECT document_id, title, markdown, markdown_sha256,
+              section_revision_sha256, section_count, search_span_count, last_synced_at
        FROM editor_knowledge_documents
        WHERE document_id = ?
        LIMIT 1`,
       [documentId]
     );
     return rows[0] ?? null;
+  }
+
+  /**
+   * Read-only pre-flight check for editor-knowledge-schema.sql, run by
+   * migrate-editor-knowledge before applying anything. The migration itself is already
+   * additive-only (CREATE TABLE IF NOT EXISTS / ALTER TABLE ... ADD COLUMN IF NOT EXISTS,
+   * both natively idempotent), but this guard makes that verifiable against the live schema
+   * instead of only being true by construction: it counts existing editor_knowledge_documents
+   * rows (must be left untouched — overview/lesson-01..07 live there), and it flags the rare
+   * case where one of the three new columns already exists with an unexpected data type
+   * (which "ADD COLUMN IF NOT EXISTS" would silently no-op on, masking real schema drift).
+   * Runs no DDL and mutates nothing.
+   */
+  async inspectEditorKnowledgeSchemaGuard(): Promise<EditorKnowledgeSchemaGuardResult> {
+    const [tableRows] = await this.pool.execute<Array<RowDataPacket & { TABLE_NAME: string }>>(
+      `SELECT TABLE_NAME
+       FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME IN ('editor_knowledge_documents', 'editor_knowledge_sections')`
+    );
+    const existingTableNames = tableRows.map((row) => row.TABLE_NAME);
+    const documentsTableExists = existingTableNames.includes("editor_knowledge_documents");
+
+    let documentRowCount = 0;
+    let columnRows: Array<{ COLUMN_NAME: string; DATA_TYPE: string }> = [];
+    if (documentsTableExists) {
+      const [countRows] = await this.pool.execute<Array<RowDataPacket & { row_count: number }>>(
+        "SELECT COUNT(*) AS row_count FROM editor_knowledge_documents"
+      );
+      documentRowCount = Number(countRows[0]?.row_count ?? 0);
+
+      const [rows] = await this.pool.execute<Array<RowDataPacket & {
+        COLUMN_NAME: string;
+        DATA_TYPE: string;
+      }>>(
+        `SELECT COLUMN_NAME, DATA_TYPE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'editor_knowledge_documents'
+           AND COLUMN_NAME IN ('section_revision_sha256', 'section_count', 'search_span_count')`
+      );
+      columnRows = rows;
+    }
+
+    return computeEditorKnowledgeSchemaGuardResult(existingTableNames, documentRowCount, columnRows);
   }
 
   async getBusinessKnowledgeDocumentRevision(documentId: string): Promise<string | null> {
@@ -334,17 +503,6 @@ export class TidbClient {
     return rows[0]?.section_revision_sha256 ?? null;
   }
 
-  async getAuthorStyleDocumentRevision(documentId: string): Promise<string | null> {
-    const [rows] = await this.pool.execute<Array<RowDataPacket & { active_revision_sha256: string | null }>>(
-      `SELECT active_revision_sha256
-       FROM author_style_documents
-       WHERE document_id = ?
-       LIMIT 1`,
-      [documentId]
-    );
-    return rows[0]?.active_revision_sha256 ?? null;
-  }
-
   async upsertAuthorStyleDocumentAndSections(document: LoadedAuthorStyleDocument): Promise<void> {
     const connection = await this.pool.getConnection();
     try {
@@ -352,30 +510,17 @@ export class TidbClient {
       await connection.execute(
         `INSERT INTO author_style_documents
           (document_id, author_key, style_scope, display_name, source_path_key,
-           active_revision_sha256, status, last_synced_at)
-         VALUES (?, ?, ?, ?, ?, NULL, 'active', NULL)
+           context_sha256, source_markdown, source_markdown_sha256, source_bytes,
+           source_line_count, source_mtime_ms, parser_version, sectioning_version,
+           routing_version, routing_manifest_json, outline_json, section_count,
+           delivery_section_count, search_span_count, status, last_synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NOW(3))
          ON DUPLICATE KEY UPDATE
           author_key = VALUES(author_key),
           style_scope = VALUES(style_scope),
           display_name = VALUES(display_name),
           source_path_key = VALUES(source_path_key),
-          status = 'active'`,
-        [
-          document.documentId,
-          document.authorKey,
-          document.styleScope,
-          document.displayName,
-          document.sourcePathKey
-        ]
-      );
-      await connection.execute(
-        `INSERT INTO author_style_revisions
-          (document_id, revision_sha256, source_markdown, source_markdown_sha256,
-           source_bytes, source_line_count, source_mtime_ms, parser_version,
-           sectioning_version, routing_version, routing_manifest_json, outline_json,
-           section_count, delivery_section_count, search_span_count, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
-         ON DUPLICATE KEY UPDATE
+          context_sha256 = VALUES(context_sha256),
           source_markdown = VALUES(source_markdown),
           source_markdown_sha256 = VALUES(source_markdown_sha256),
           source_bytes = VALUES(source_bytes),
@@ -389,9 +534,14 @@ export class TidbClient {
           section_count = VALUES(section_count),
           delivery_section_count = VALUES(delivery_section_count),
           search_span_count = VALUES(search_span_count),
-          synced_at = NOW(3)`,
+          status = 'active',
+          last_synced_at = NOW(3)`,
         [
           document.documentId,
+          document.authorKey,
+          document.styleScope,
+          document.displayName,
+          document.sourcePathKey,
           document.revisionSha256,
           document.sourceMarkdown,
           document.sourceMarkdownSha256,
@@ -408,15 +558,14 @@ export class TidbClient {
           document.searchSpanCount
         ]
       );
+      await connection.execute(
+        `DELETE FROM author_style_current_sections
+         WHERE document_id = ?`,
+        [document.documentId]
+      );
       for (const section of document.sections) {
         await upsertAuthorStyleSection(connection, section);
       }
-      await connection.execute(
-        `UPDATE author_style_documents
-         SET active_revision_sha256 = ?, last_synced_at = NOW(3)
-         WHERE document_id = ?`,
-        [document.revisionSha256, document.documentId]
-      );
       await connection.commit();
     } catch (error) {
       await connection.rollback();
@@ -429,7 +578,11 @@ export class TidbClient {
   async getAuthorStyleDocument(documentId: string): Promise<AuthorStyleDocumentRow | null> {
     const [rows] = await this.pool.execute<AuthorStyleDocumentRow[]>(
       `SELECT document_id, author_key, style_scope, display_name, source_path_key,
-              active_revision_sha256, status, last_synced_at
+              context_sha256, source_markdown, source_markdown_sha256,
+              source_bytes, source_line_count, source_mtime_ms, parser_version,
+              sectioning_version, routing_version, routing_manifest_json,
+              outline_json, section_count, delivery_section_count, search_span_count,
+              status, last_synced_at
        FROM author_style_documents
        WHERE document_id = ?
        LIMIT 1`,
@@ -438,38 +591,18 @@ export class TidbClient {
     return rows[0] ?? null;
   }
 
-  async getAuthorStyleRevision(
-    documentId: string,
-    revisionSha256: string
-  ): Promise<AuthorStyleRevisionRow | null> {
-    const [rows] = await this.pool.execute<AuthorStyleRevisionRow[]>(
-      `SELECT document_id, revision_sha256, source_markdown, source_markdown_sha256,
-              source_bytes, source_line_count, source_mtime_ms, parser_version,
-              sectioning_version, routing_version, routing_manifest_json, outline_json,
-              section_count, delivery_section_count, search_span_count, synced_at
-       FROM author_style_revisions
-       WHERE document_id = ? AND revision_sha256 = ?
-       LIMIT 1`,
-      [documentId, revisionSha256]
-    );
-    return rows[0] ?? null;
-  }
-
-  async listAuthorStyleSections(
-    documentId: string,
-    revisionSha256: string
-  ): Promise<AuthorStyleSectionRow[]> {
+  async listAuthorStyleSections(documentId: string): Promise<AuthorStyleSectionRow[]> {
     const [rows] = await this.pool.execute<AuthorStyleSectionRow[]>(
-      `SELECT document_id, revision_sha256, section_id, context_key,
+      `SELECT document_id, section_id, context_key,
               parent_section_id, delivery_section_id, section_type, content_layer,
               context_priority, heading_level, title, heading_path_json, aliases_json,
               ordinal, source_line_start, source_line_end, content_chars,
               estimated_tokens, direct_markdown, delivery_markdown, retrieval_text,
               content_sha256, is_searchable
-       FROM author_style_sections
-       WHERE document_id = ? AND revision_sha256 = ?
+       FROM author_style_current_sections
+       WHERE document_id = ?
        ORDER BY ordinal ASC`,
-      [documentId, revisionSha256]
+      [documentId]
     );
     return rows;
   }
@@ -825,14 +958,14 @@ async function upsertAuthorStyleSection(
   section: AuthorStyleSection
 ): Promise<void> {
   await connection.execute(
-    `INSERT INTO author_style_sections
-      (document_id, revision_sha256, section_id, context_key, parent_section_id,
+    `INSERT INTO author_style_current_sections
+      (document_id, section_id, context_key, parent_section_id,
        delivery_section_id, section_type, content_layer, context_priority,
        heading_level, title, heading_path_json, aliases_json, ordinal,
        source_line_start, source_line_end, content_chars, estimated_tokens,
        direct_markdown, delivery_markdown, retrieval_text, content_sha256,
        is_searchable)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
       context_key = VALUES(context_key),
       parent_section_id = VALUES(parent_section_id),
@@ -856,7 +989,6 @@ async function upsertAuthorStyleSection(
       is_searchable = VALUES(is_searchable)`,
     [
       section.documentId,
-      section.revisionSha256,
       section.sectionId,
       section.contextKey,
       section.parentSectionId,
@@ -950,7 +1082,7 @@ export function tidbOptionsFromEnv(): TidbOptions {
     port: envNumber("TIDB_PORT", 4000),
     user: requireEnv("TIDB_USER"),
     password: requireEnv("TIDB_PASSWORD"),
-    database: optionalEnv("TIDB_DATABASE") ?? "notion_context",
+    database: optionalEnv("TIDB_DATABASE") ?? "example_context",
     enableSsl: envBoolean("TIDB_ENABLE_SSL", true),
     caPath: optionalEnv("TIDB_CA_PATH")
   };

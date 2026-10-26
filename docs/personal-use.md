@@ -1,113 +1,69 @@
-# Personal Use With a Public Repository
+# 公開リポジトリと自分のデータを分ける
 
-This repository is designed to be public, while personal runtime data stays local.
+このリポジトリには実装と合成サンプルを置き、実際のデータや接続情報は利用者の環境で管理します。
 
-## Keep These Local
+## ローカルに置くもの
 
-Do not commit these files:
+- `mycontext-sync/.env` と、必要に応じて `mirror.config.json`
+- 各 Worker の `.dev.vars`
+- 実際の Notion page / data source ID、文書名、同期元の絶対パス
+- 同期済み Markdown、Obsidian export、緊急復旧用 snapshot
+- DB、ログ、memory、デプロイ用の設定
 
-- `mycontext-sync/.env`
-- `mycontext-sync/mirror.config.json`
-- `mycontext-mcp-worker/.dev.vars`
-- `MEMORY.md`
-- `**/MEMORY.md`
-- `logs/`
-- `node_modules/`
-- `.wrangler/`
+これらを公開用のファイルへコピーしないでください。`.env.example` / `.dev.vars.example` は空欄やダミー値を使います。公開サンプルの著者は `example-author`、文書 ID は `example-title-style` / `example-body-style` です。
 
-They are ignored by git. They can contain Notion page IDs, private page titles,
-absolute local Markdown source paths, Notion API keys, TiDB credentials, OAuth
-secrets, local logs, or generated memory summaries.
+## CLI の設定
 
-## Recommended Local Setup
-
-Keep personal Notion seed pages in `.env`:
+`mycontext-sync/.env` では、たとえば次の設定を使用します。下記の値は説明用のプレースホルダーです。
 
 ```env
 MIRROR_CONFIG_JSON={"pages":[{"pageId":"your-private-page-id","title":"your-private-page-title"}]}
 EDITOR_KNOWLEDGE_SOURCE_ROOT=/absolute/path/to/editor-knowledge-library
 BUSINESS_KNOWLEDGE_SOURCE_ROOT=/absolute/path/to/business-knowledge-library
-AUTHOR_STYLE_SOURCE_ROOT=/absolute/path/to/author-style-library
 METASKILL_SOURCE_ROOT=/absolute/path/to/metaskill-library
 ```
 
-`MIRROR_CONFIG_JSON` takes precedence over `mirror.config.json`. This lets you
-keep the sync target and credentials together in the ignored `.env` file.
+`MIRROR_CONFIG_JSON` は `mirror.config.json` より優先されます。各 `*_SOURCE_ROOT` はローカル専用で、取り込みは実装が許可する固定の相対パスに限定されます。
 
-Existing local `mirror.config.json` files still work. If `MIRROR_CONFIG_JSON`
-is absent, the CLI reads `mirror.config.json` as before.
+Author Style は Notion を正本とします。通常同期に `AUTHOR_STYLE_SOURCE_ROOT` や `pull-author-style` は使いません。[合成サンプル](../mycontext-sync/examples/author-style/)を自分の Notion ページに置き、同期 Worker の `AUTHOR_STYLE_TITLE_PAGE_ID` / `AUTHOR_STYLE_BODY_PAGE_ID` に許可するページを設定します。Notion の管理プロパティと初回 webhook 登録は [同期 Worker の README](../mycontext-sync-worker/README.md) を参照してください。
 
-`BUSINESS_KNOWLEDGE_SOURCE_ROOT` is used only with a fixed two-file allowlist.
-The absolute value is never stored in TiDB or exposed by MCP; TiDB stores only
-the public-safe relative source key.
+Author Style の `source_path_key` は同期元を識別する `notion:<page-id>` です。これは実行先 DB に保存する運用データであり、公開用のサンプルやテストには実際の page ID を含めません。
 
-`AUTHOR_STYLE_SOURCE_ROOT` is also local-only. The author-style sync reads only
-the fixed title/body paths under `knowledge/`; TiDB stores relative source keys,
-full Markdown revisions, and semantic sections, never the machine-local root.
+## スキーマの準備
 
-`METASKILL_SOURCE_ROOT` follows the same rule: the sync reads one fixed relative
-Markdown path and never stores or returns the machine-local root.
+Notion から Author Style だけを同期する場合も、CLI の `migrate-author-style` と `migrate-sync-state-log` を実行します。後者は同期処理が毎回記録する状態ログのテーブルです。MCP の一般検索・文書取得・Resource 一覧を併用する場合は、[root README の全 migration](../README.md#cli-とその他の文書) で空テーブルも準備してください。
 
-For the business corpus, use the dedicated migration and sync commands. They
-only create/write `business_knowledge_documents` and
-`business_knowledge_sections`; the sync path contains no `DELETE`, `TRUNCATE`,
-`DROP`, or writes to the existing Notion/editor tables.
+分析スキル用の `skill_context_documents` は任意です。migration と取り込みコマンドは同梱していないため、その機能を使う利用者が別途用意します。Author Style の専用取得には必要ありません。
 
-```bash
-pnpm migrate-business-knowledge
-pnpm pull-business-knowledge
-pnpm doctor-business-knowledge
-pnpm migrate-author-style
-pnpm pull-author-style
-pnpm doctor-author-style
-pnpm migrate-metaskill
-pnpm pull-metaskill
-pnpm doctor-metaskill
-```
+## 認証情報の分離
 
-## Production Secrets
+MCP Worker は読み取り専用の TiDB 接続と OAuth 用 secret を持ちます。同期 Worker は別の TiDB writer と Notion integration を持ちます。それぞれの `.dev.vars.example` と README に従って設定してください。
 
-Use platform secrets for deployed Worker values:
+ローカル用 `.dev.vars` は gitignored なファイルとして作成し、デプロイ時はプラットフォームの secret を使用します。origin、KV namespace ID、Queue、Notion の許可ページも自分の環境の値へ変更します。実値を公開リポジトリへ commit しないでください。
+
+## Export と緊急復旧
+
+Notion 文書のローカル export は `pnpm export-obsidian` です。Author Style の緊急 snapshot は次のコマンドで書き出します。
 
 ```bash
-wrangler secret put TIDB_DATABASE_URL
-wrangler secret put GITHUB_CLIENT_ID
-wrangler secret put GITHUB_CLIENT_SECRET
-wrangler secret put GITHUB_ALLOWED_USER_ID
+cd mycontext-sync
+pnpm export-author-style-markdown -- --document-id example-body-style
 ```
 
-Local Worker development can use `mycontext-mcp-worker/.dev.vars`, which is
-ignored by git.
+export ファイルは私的な本文を含むため、公開対象の外に保管してください。復旧はまず dry-run で検証します。
 
-## Before Pushing
+```bash
+pnpm restore-author-style-markdown -- --document-id example-body-style   --input-path /private/path/snapshot.md --dry-run
+```
 
-Run:
+実際の復旧には `--activate-emergency` が必要です。通常の同期は、Notion 上の正しい本文を確認して `Ready` に戻す運用を続けます。
+
+## 公開前の確認
 
 ```bash
 ./scripts/check-public-safety.sh
 ```
 
-Then run the subproject checks:
+このチェックは追跡済みファイルと、未追跡で ignore されていないファイルを検査します。各サブプロジェクトの型検査・テスト・dry-run は [root README](../README.md#ローカル検証) を参照してください。
 
-```bash
-cd mycontext-sync
-pnpm run typecheck
-pnpm test
-pnpm audit --audit-level moderate
-
-cd ../mycontext-mcp-worker
-pnpm run typecheck
-pnpm test
-pnpm audit --audit-level moderate
-```
-
-The public safety check scans tracked and untracked non-ignored files for local
-secret files, common token patterns, machine-local paths, environment IDs,
-generated memory files, and known private-project identifiers.
-
-## If Something Leaks
-
-1. Rotate the affected secret first.
-2. Remove the value from the repository.
-3. Rewrite public history if the value was pushed.
-4. Re-run `./scripts/check-public-safety.sh`.
+追加したサンプルや fixture が実際の個人データから作られていないことも確認します。値を置換しただけの私的なガイド本文や書籍の文字起こしを、公開サンプルとして含めないでください。

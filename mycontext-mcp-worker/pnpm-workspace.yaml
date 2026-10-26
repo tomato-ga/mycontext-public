@@ -3,3 +3,7 @@ allowBuilds:
   esbuild: true
   sharp: false
   workerd: true
+
+# Miniflare pins an older Undici; use the patched compatible 7.x release.
+overrides:
+  miniflare@5.20261019.2-beta>undici: 7.30.1

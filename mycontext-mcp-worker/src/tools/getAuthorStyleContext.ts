@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
   AUTHOR_STYLE_DOCUMENT_IDS,
@@ -14,6 +14,7 @@ import {
 } from "../authorStyle.js";
 import { MCP_SCOPE } from "../constants.js";
 import { getAuthorStyleContext, type TidbClient } from "../tidb.js";
+import { buildTextToolResult } from "./textResult.js";
 
 const allOperations = [...new Set([...TITLE_OPERATIONS, ...BODY_OPERATIONS])] as [
   string,
@@ -30,8 +31,8 @@ export function registerGetAuthorStyleContextTool(
     {
       title: "Get author style context pack",
       description:
-        "Get one complete, selector-specific context pack for reproducing or evaluating ore's title/body style. Use this normal path instead of loading the full source document. No selected section is truncated.",
-      inputSchema: {
+        "Get one complete, selector-specific context pack for reproducing or evaluating the example author's title/body style. Use this normal path instead of loading the full source document. No selected section is truncated.",
+      inputSchema: z.object({
         documentId: z.enum(AUTHOR_STYLE_DOCUMENT_IDS).describe(
           "example-title-style for titles; example-body-style for article bodies"
         ),
@@ -47,7 +48,7 @@ export function registerGetAuthorStyleContextTool(
         profile: z.enum(AUTHOR_STYLE_PROFILES).default("neutral").describe(
           "media-specific is supported only for example-body-style."
         )
-      },
+      }),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -68,10 +69,7 @@ export function registerGetAuthorStyleContextTool(
           };
         }
         const { markdown: _markdown, ...metadata } = context;
-        return {
-          content: [{ type: "text" as const, text: context.markdown }],
-          structuredContent: metadata
-        };
+        return buildTextToolResult(context.markdown, metadata);
       } catch (error) {
         if (error instanceof AuthorStyleRoutingError || error instanceof AuthorStyleContextTooLargeError) {
           return {

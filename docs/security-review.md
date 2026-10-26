@@ -1,133 +1,49 @@
-# Security Review
+# Publication Security Review
 
-Date: 2026-07-17
+Updated: 2026-10-26
 
-## Executive Summary
+This document describes the public sample's publication boundaries. It does not certify a live deployment or access to private Notion / TiDB data.
 
-This sanitized sample repository is ready to remain private until its owner
-chooses to make it public. The repository contains no real credentials,
-machine-local source roots, personal author IDs, Worker hostname, or Cloudflare
-KV namespace IDs. The committed runtime configuration uses explicit
-placeholders, and the public-safety script scans both tracked and untracked
-non-ignored files.
+## Published contents
 
-The Worker is a read-only MCP surface. `/healthz` is public and returns only
-`ok`; `/mcp` is protected by OAuth 2.1, S256 PKCE, the `context:read` scope, and
-an allowlisted immutable GitHub user ID. SQL input is parameterized, selector
-values are allowlisted, and tools are declared read-only and non-destructive.
+The public repository contains reusable code, schemas, example configuration, and synthetic fixtures. It excludes real environment files, credentials, private document bodies, machine-local paths, production origin / namespace identifiers, exports, operational incident logs, and generated memory.
 
-This review covers repository publication, not a live production deployment.
-Before deploying, the operator must supply their own secrets, origin, KV IDs,
-database permissions, and Cloudflare edge rate limits.
+Author Style uses `example-author`, `example-title-style`, `example-body-style`, and the `example-title/` / `example-body/` key prefixes. Sample Markdown is authored for this repository; it is not a redacted copy of a private style guide.
 
-## Findings
+The source repository's Git history is not merged into the public history. Publication changes are applied as sanitized files to this repository.
 
-### SEC-001: Private files and source content could be published accidentally
+## Implementation boundaries
 
-- Severity: High
-- Location: `.gitignore`, `scripts/check-public-safety.sh`
-- Evidence: local `.env`, `.dev.vars`, `mirror.config.json`, databases, logs,
-  generated memory files, dependency folders, and build output are ignored.
-  The safety script enumerates tracked plus untracked non-ignored files and
-  reports filenames only when it detects a likely secret or private identifier.
-- Fix: keep only example configuration in git and run the safety check in CI.
-- Status: Fixed and verified with a deliberately untracked path-leak probe.
+| Area | Boundary to preserve |
+| --- | --- |
+| Public file selection | `.gitignore` and `scripts/check-public-safety.sh` cover local data and scan tracked plus untracked non-ignored files. Inspect new fixture and document contents as well. |
+| MCP retrieval | OAuth, S256 PKCE, `context:read`, and the configured immutable GitHub user ID protect access. The database credential must have read-only grants. |
+| Notion synchronization | A separate Worker verifies signed webhooks, queues work, validates document ownership and content, and updates workflow properties rather than page bodies. |
+| Snapshot replacement | Author Style documents and current sections change in the same transaction. Validation failure keeps the previous snapshot. |
+| SQL and selectors | Parameters, supported document IDs, selector validation, and bounded limits restrict query inputs. No raw SQL tool is exposed. |
+| State log | Sync metadata belongs in an append-only operational table. Private runtime logs and exported snapshots stay outside Git. |
+| Deployment | Origin, KV IDs, page IDs, Queue bindings, secrets, DB grants, and edge rate limits must be supplied for each deployment. |
 
-### SEC-002: Deployment identifiers were tied to one private environment
+Author Style uses `author_style_documents` and `author_style_current_sections`. It no longer uses the public sample's old Author Style revision / active-revision storage path. Metaskill keeps its own revision model.
 
-- Severity: High
-- Location: `mycontext-mcp-worker/src/constants.ts`,
-  `mycontext-mcp-worker/wrangler.jsonc`
-- Evidence: the Worker origin uses the reserved documentation hostname
-  `mycontext-mcp.example.workers.dev`; both KV namespace IDs use explicit
-  `REPLACE_WITH_*` placeholders. The sample cron is generic.
-- Fix: require each operator to create their own OAuth/Auth KV namespaces and
-  replace the example origin before deployment.
-- Status: Fixed for publication.
+The sync Worker always writes `context_sync_state_log`, including Author Style-only synchronization. Bootstrap that table alongside the Author Style tables. General search, document retrieval, and Resource listing also require the other context schemas, even if their tables are empty. The optional `skill_context_documents` table is not provisioned by a bundled migration or import command; operators enabling analysis-skill retrieval must provide it separately. Author Style-specific retrieval does not depend on it.
 
-### SEC-003: Runtime data access must remain read-only and authenticated
+## Verification scope
 
-- Severity: High
-- Location: `mycontext-mcp-worker/src/index.ts`, `src/tidb.ts`, `src/tools/`
-- Evidence: `/mcp` is routed through the OAuth provider, all MCP tools require
-  `context:read`, all tool annotations declare read-only/non-destructive
-  behavior, and the Worker SQL contains SELECT-only retrieval paths. Baseline
-  security headers wrap Worker responses.
-- Fix: retain a database user with SELECT-only grants for every context table.
-- Status: Fixed by design and covered by tests.
+Local checks should cover the public-safety scan, frozen dependency installation, typecheck and tests for all three subprojects, and Worker deployment dry-runs. The synthetic tests can verify parsing, routing, over-limit errors, authentication boundaries, and synchronization behavior without connecting to private data.
 
-### SEC-004: Specialized corpora could leak into broad search paths
+These checks do not verify live OAuth, real secrets, Notion integration permissions, webhook delivery, TiDB grants, or Cloudflare rate limits. A dry-run confirms that the Worker builds; it does not deploy it.
 
-- Severity: High
-- Location: dedicated `business_knowledge_*`, `author_style_*`, and
-  `metaskill_*` schemas, parsers, resources, and tools
-- Evidence: business, author-style, and metaskill data use fixed relative
-  source allowlists and dedicated tables. Author-style and metaskill revisions
-  activate transactionally and use dedicated retrieval tools; machine-local
-  source roots are never stored.
-- Fix: preserve separate retrieval paths, active-revision joins, and semantic
-  delivery sections rather than exposing arbitrary filesystem or SQL access.
-- Status: Fixed by design and covered by tests.
+### Verification record for this update
 
-### SEC-005: User-controlled selectors and limits require validation
+The following checks were completed for the sanitized publication update. They use synthetic data and do not connect to private services.
 
-- Severity: Medium
-- Location: Worker tool schemas and `mycontext-mcp-worker/src/tidb.ts`
-- Evidence: structured tool inputs are schema-validated, selector values are
-  allowlisted, search terms use query parameters, and numeric limits pass
-  through `validateTopK` before SQL interpolation.
-- Fix: continue rejecting unknown selector values and invalid limits before DB
-  access; do not add a raw SQL tool.
-- Status: Fixed and covered by tests.
-
-### SEC-006: Abuse controls depend on the deployment edge
-
-- Severity: Medium
-- Location: deployment configuration outside this repository
-- Evidence: the sample intentionally does not contain account-specific
-  Cloudflare WAF or rate-limiting rules.
-- Fix: before Internet deployment, configure rate limits for `/oauth/*`,
-  `/authorize`, `/token`, `/register`, and `/mcp`, and monitor authentication
-  failures without logging tokens or private context.
-- Status: Required before production deployment; not a repository-publication
-  blocker.
-
-### SEC-007: CI should use least privilege and reject vulnerable dependencies
-
-- Severity: Low
-- Location: `.github/workflows/ci.yml`
-- Evidence: workflow permissions are restricted to `contents: read`; both
-  subprojects run frozen installs, typecheck, tests, moderate-level dependency
-  audits, and the repository safety check.
-- Status: Fixed.
-
-## Verification Results
-
-Executed on 2026-07-17:
-
-```bash
-./scripts/check-public-safety.sh
-
-cd mycontext-sync
-pnpm install --frozen-lockfile
-pnpm run typecheck
-pnpm test
-pnpm audit --audit-level moderate
-
-cd ../mycontext-mcp-worker
-pnpm install --frozen-lockfile
-pnpm run typecheck
-pnpm test
-pnpm audit --audit-level moderate
-```
-
-Results:
-
-- Public-safety check: passed; an untracked path-leak probe was rejected.
-- `mycontext-sync`: typecheck passed; 16 test files / 34 tests passed; no known
-  moderate-or-higher dependency vulnerabilities.
-- `mycontext-mcp-worker`: typecheck passed; 12 test files / 46 tests passed;
-  two live smoke files (two tests) were skipped because they require a private
-  `TIDB_DATABASE_URL`; no known moderate-or-higher dependency vulnerabilities.
-- No live deployment, private database, or real OAuth flow was used during this
-  publication review.
+- Existing public history: both existing commits / 140 unique blobs were scanned during this update; no known secret, private identifier, prohibited runtime file, or private commit identity was detected.
+- Publication safety: tracked, untracked, and staged contents are scanned, including dependency metadata. The safety scanner has 27 isolated regression cases.
+- CLI: pnpm 11.7.0 frozen installation, typecheck, and 81 tests passed.
+- MCP Worker: frozen strict-peer installation, typecheck, 191 tests, and Wrangler deployment dry-run passed.
+- Sync Worker: frozen installation, typecheck, 68 tests, and Wrangler deployment dry-run passed.
+- Cross-component contract: synthetic Markdown was parsed into stored-row shapes and read through the MCP reader for all 368 selector combinations. Complete sections and identical routing were verified; oversized packs and missing sections were rejected. The long explanatory body example returned 13 sections.
+- Dependency audits: all three projects reported no known vulnerabilities after patched dependency updates. The scoped Undici overrides in the Worker workspaces replace Miniflare's pinned vulnerable patch with a compatible fix.
+- Documentation: relative links resolve, and initialization distinguishes Author Style synchronization from the full MCP schema requirements.
+- Live deployment or private data operations: outside the publication update scope.

@@ -11,7 +11,8 @@ const MEDIUMTEXT_MAX_BYTES = 16_777_215;
 
 export const BUSINESS_KNOWLEDGE_DOCUMENT_IDS = [
   "startup-science",
-  "marketing-wisdom"
+  "marketing-wisdom",
+  "example-business-guide"
 ] as const;
 
 export type BusinessKnowledgeDocumentId = typeof BUSINESS_KNOWLEDGE_DOCUMENT_IDS[number];
@@ -20,8 +21,8 @@ export type BusinessKnowledgeContentLayer = "summary" | "detail" | "index";
 export interface BusinessKnowledgeSource {
   documentId: BusinessKnowledgeDocumentId;
   relativePath: string;
-  sourceKind: "book_summary" | "web_export_index";
-  ingestScope: "full_summary" | "index_only";
+  sourceKind: "book_summary" | "web_export_index" | "book_transcription";
+  ingestScope: "full_summary" | "index_only" | "full_text";
   sourceDeclaredAt: string | null;
 }
 
@@ -71,12 +72,12 @@ export interface LoadedBusinessKnowledgeDocument {
   sections: BusinessKnowledgeSection[];
 }
 
-interface ParsedSectionInput extends Omit<
+export interface ParsedSectionInput extends Omit<
   BusinessKnowledgeSection,
   "documentId" | "sectionRevisionSha256" | "ordinal" | "contentSha256"
 > {}
 
-interface ParsedDocumentSections {
+export interface ParsedDocumentSections {
   sections: ParsedSectionInput[];
   outline: Record<string, unknown>;
   routingMetadata: Record<string, unknown>;
@@ -164,7 +165,7 @@ export async function loadBusinessKnowledgeDocument(
 
   let markdown: string;
   try {
-    markdown = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "");
+    markdown = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes).replace(/^\uFEFF/, "");
   } catch (error) {
     throw new AppError(
       "business_knowledge_invalid_utf8",
@@ -457,6 +458,290 @@ function parseMarketingWisdom(documentTitle: string, lines: string[]): ParsedDoc
   };
 }
 
+/**
+ * Shared with editorKnowledge.ts: the planning composition playbook and planning DB catalog are
+ * modeled as sectioned Editor Knowledge documents, not Business Knowledge documents, but they
+ * reuse this exact parsing/validation/error-code machinery unchanged.
+ */
+export function parsePlanningPlaybook(documentTitle: string, lines: string[]): ParsedDocumentSections {
+  const headings = scanMarkdownHeadings(lines);
+  const chapterHeadings = headings.filter((heading) => heading.level === 2);
+  if (chapterHeadings.length === 0) {
+    throw new AppError(
+      "planning_playbook_no_chapters",
+      "planning composition playbook must contain at least one ## chapter heading",
+      3
+    );
+  }
+  assertNumberedHeadings(chapterHeadings, /^(\d+)\.\s/, chapterHeadings.length, "planning playbook chapters");
+
+  const sections: ParsedSectionInput[] = [];
+  const outlineChapters: Array<{ key: string; title: string; number: number }> = [];
+  for (let index = 0; index < chapterHeadings.length; index += 1) {
+    const heading = chapterHeadings[index];
+    const nextLine = chapterHeadings[index + 1]?.line ?? lines.length + 1;
+    const number = Number(/^(\d+)\./.exec(heading.title)?.[1]);
+    const sectionId = `chapter-${twoDigits(number)}`;
+    const headingPath = [documentTitle, heading.title];
+    const markdown = sliceLines(lines, heading.line, nextLine - 1);
+    outlineChapters.push({ key: sectionId, title: heading.title, number });
+    sections.push({
+      sectionId,
+      parentSectionId: null,
+      deliverySectionId: sectionId,
+      sectionType: "markdown_heading",
+      headingLevel: 2,
+      sectionNumber: String(number),
+      title: heading.title,
+      headingPath,
+      contentLayer: "detail",
+      sourceLineStart: heading.line,
+      sourceLineEnd: nextLine - 1,
+      directMarkdown: markdown,
+      sectionMarkdown: markdown,
+      retrievalText: contextualize(headingPath, markdown),
+      isSearchable: true,
+      relatedSourcePath: null,
+      freshnessClass: "static_framework"
+    });
+  }
+
+  return {
+    sections,
+    outline: { chapters: outlineChapters },
+    routingMetadata: { defaultRetrieval: "direct", detailAvailable: false }
+  };
+}
+
+const KIKAKU_CATALOG_MAX_GROUPS = 10;
+const KIKAKU_CATALOG_GROUP_LETTERS = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] as const;
+const KIKAKU_CATALOG_ENTRY_PATTERN = /^No\.(?:(\d+)|なし-(\d+))\s*｜\s*(.+)$/;
+
+/** Shared with editorKnowledge.ts, see parsePlanningPlaybook. */
+export function parsePlanningCatalog(documentTitle: string, lines: string[]): ParsedDocumentSections {
+  const headings = scanMarkdownHeadings(lines);
+  const structuralHeadings = headings.filter((heading) => heading.level === 2 || heading.level === 3);
+  const disallowed = headings.find((heading) => {
+    return heading.level !== 1 && heading.level !== 2 && heading.level !== 3;
+  });
+  if (disallowed !== undefined) {
+    throw new AppError(
+      "planning_catalog_heading_level_invalid",
+      `planning db catalog only allows ## group and ### entry headings, found level ${disallowed.level} heading "${disallowed.title}"`,
+      3
+    );
+  }
+  if (structuralHeadings.length === 0) {
+    throw new AppError(
+      "planning_catalog_no_entries",
+      "planning db catalog must contain at least one ### entry heading",
+      3
+    );
+  }
+  if (structuralHeadings[0].level !== 2) {
+    throw new AppError(
+      "planning_catalog_orphan_entry",
+      "planning db catalog must begin with a ## group heading before any ### entry",
+      3
+    );
+  }
+
+  const groupHeadings = structuralHeadings.filter((heading) => heading.level === 2);
+  if (groupHeadings.length > KIKAKU_CATALOG_MAX_GROUPS) {
+    throw new AppError(
+      "planning_catalog_too_many_groups",
+      `planning db catalog expected at most ${KIKAKU_CATALOG_MAX_GROUPS} group headings, got ${groupHeadings.length}`,
+      3
+    );
+  }
+  const entryHeadings = structuralHeadings.filter((heading) => heading.level === 3);
+
+  const sections: ParsedSectionInput[] = [];
+  const outlineGroups: Array<{ key: string; title: string; entryCount: number }> = [];
+  let totalEntries = 0;
+
+  for (let groupIndex = 0; groupIndex < groupHeadings.length; groupIndex += 1) {
+    const groupHeading = groupHeadings[groupIndex];
+    const groupEnd = groupHeadings[groupIndex + 1]?.line ?? lines.length + 1;
+    const groupKey = `group-${KIKAKU_CATALOG_GROUP_LETTERS[groupIndex]}`;
+    const groupPath = [documentTitle, groupHeading.title];
+    const childEntryHeadings = entryHeadings.filter((heading) => {
+      return heading.line > groupHeading.line && heading.line < groupEnd;
+    });
+    const firstChildLine = childEntryHeadings[0]?.line ?? groupEnd;
+    const groupDirectMarkdown = sliceLines(lines, groupHeading.line, firstChildLine - 1);
+    const groupSectionMarkdown = sliceLines(lines, groupHeading.line, groupEnd - 1);
+
+    sections.push({
+      sectionId: groupKey,
+      parentSectionId: null,
+      deliverySectionId: groupKey,
+      sectionType: "markdown_heading",
+      headingLevel: 2,
+      sectionNumber: null,
+      title: groupHeading.title,
+      headingPath: groupPath,
+      contentLayer: "index",
+      sourceLineStart: groupHeading.line,
+      sourceLineEnd: groupEnd - 1,
+      directMarkdown: groupDirectMarkdown,
+      sectionMarkdown: groupSectionMarkdown,
+      retrievalText: contextualize(groupPath, groupDirectMarkdown),
+      isSearchable: false,
+      relatedSourcePath: null,
+      freshnessClass: "static_framework"
+    });
+
+    for (let entryIndex = 0; entryIndex < childEntryHeadings.length; entryIndex += 1) {
+      const entryHeading = childEntryHeadings[entryIndex];
+      const entryEnd = childEntryHeadings[entryIndex + 1]?.line ?? groupEnd;
+      const parsedEntry = parsePlanningCatalogEntryHeading(entryHeading.title);
+      const sectionId = parsedEntry.numbered
+        ? `no-${threeDigits(parsedEntry.number)}`
+        : `x-${twoDigits(parsedEntry.number)}`;
+      const entryPath = [...groupPath, entryHeading.title];
+      const entryMarkdown = sliceLines(lines, entryHeading.line, entryEnd - 1);
+      sections.push({
+        sectionId,
+        parentSectionId: null,
+        deliverySectionId: sectionId,
+        sectionType: "markdown_heading",
+        headingLevel: 3,
+        sectionNumber: parsedEntry.numbered ? String(parsedEntry.number) : null,
+        title: entryHeading.title,
+        headingPath: entryPath,
+        contentLayer: "detail",
+        sourceLineStart: entryHeading.line,
+        sourceLineEnd: entryEnd - 1,
+        directMarkdown: entryMarkdown,
+        sectionMarkdown: entryMarkdown,
+        retrievalText: entryMarkdown,
+        isSearchable: true,
+        relatedSourcePath: null,
+        freshnessClass: "dated_example"
+      });
+      totalEntries += 1;
+    }
+
+    outlineGroups.push({ key: groupKey, title: groupHeading.title, entryCount: childEntryHeadings.length });
+  }
+
+  if (totalEntries === 0) {
+    throw new AppError(
+      "planning_catalog_no_entries",
+      "planning db catalog must contain at least one ### entry heading",
+      3
+    );
+  }
+
+  return {
+    sections,
+    outline: { groups: outlineGroups, entryCount: totalEntries },
+    routingMetadata: { defaultRetrieval: "direct", detailAvailable: true }
+  };
+}
+
+const KIKAKU_FULLTEXT_ENTRY_PATTERN = /^No\.(?:(\d{1,3})|なし-(\d{1,2})) ｜ (.+)$/;
+
+/**
+ * Shared with editorKnowledge.ts, see parsePlanningPlaybook. Unlike parsePlanningCatalog, this
+ * document has no catalog-style structural constraints (no "#### forbidden", no required
+ * groups, no required sequential numbering): the only thing that matters is finding the entry
+ * boundaries. Every other heading in the source — H2 or deeper — is left untouched as ordinary
+ * section body text, because the source is a verbatim (masking-only) reproduction of Notion
+ * note bodies that may contain their own heading-shaped lines.
+ */
+export function parsePlanningFulltext(documentTitle: string, lines: string[]): ParsedDocumentSections {
+  const headings = scanMarkdownHeadings(lines);
+  const entryHeadings = headings.flatMap((heading) => {
+    if (heading.level !== 2) return [];
+    const match = KIKAKU_FULLTEXT_ENTRY_PATTERN.exec(heading.title);
+    if (match === null) return [];
+    const numbered = match[1] !== undefined;
+    return [{ ...heading, numbered, number: Number(numbered ? match[1] : match[2]) }];
+  });
+
+  const sections: ParsedSectionInput[] = [];
+  const outlineEntries: Array<{ key: string; title: string; sectionNumber: string | null }> = [];
+
+  const firstEntryLine = entryHeadings[0]?.line ?? lines.length + 1;
+  const preambleMarkdown = sliceLines(lines, 2, firstEntryLine - 1);
+  if (preambleMarkdown.trim().length > 0) {
+    const preamblePath = [documentTitle, "前書き"];
+    sections.push({
+      sectionId: "preamble",
+      parentSectionId: null,
+      deliverySectionId: "preamble",
+      sectionType: "markdown_heading",
+      headingLevel: null,
+      sectionNumber: null,
+      title: "前書き",
+      headingPath: preamblePath,
+      contentLayer: "index",
+      sourceLineStart: 2,
+      sourceLineEnd: firstEntryLine - 1,
+      directMarkdown: preambleMarkdown,
+      sectionMarkdown: preambleMarkdown,
+      retrievalText: contextualize(preamblePath, preambleMarkdown),
+      isSearchable: false,
+      relatedSourcePath: null,
+      freshnessClass: "static_framework"
+    });
+  }
+
+  for (let index = 0; index < entryHeadings.length; index += 1) {
+    const heading = entryHeadings[index];
+    const entryEnd = entryHeadings[index + 1]?.line ?? lines.length + 1;
+    const sectionId = heading.numbered
+      ? `no-${threeDigits(heading.number)}`
+      : `x-${twoDigits(heading.number)}`;
+    const entryPath = [documentTitle, heading.title];
+    const entryMarkdown = sliceLines(lines, heading.line, entryEnd - 1);
+    const sectionNumber = heading.numbered ? String(heading.number) : null;
+    sections.push({
+      sectionId,
+      parentSectionId: null,
+      deliverySectionId: sectionId,
+      sectionType: "markdown_heading",
+      headingLevel: 2,
+      sectionNumber,
+      title: heading.title,
+      headingPath: entryPath,
+      contentLayer: "detail",
+      sourceLineStart: heading.line,
+      sourceLineEnd: entryEnd - 1,
+      directMarkdown: entryMarkdown,
+      sectionMarkdown: entryMarkdown,
+      retrievalText: entryMarkdown,
+      isSearchable: true,
+      relatedSourcePath: null,
+      freshnessClass: "dated_example"
+    });
+    outlineEntries.push({ key: sectionId, title: heading.title, sectionNumber });
+  }
+
+  return {
+    sections,
+    outline: { hasPreamble: preambleMarkdown.trim().length > 0, entryCount: entryHeadings.length, entries: outlineEntries },
+    routingMetadata: { defaultRetrieval: "direct", detailAvailable: true }
+  };
+}
+
+function parsePlanningCatalogEntryHeading(title: string): { numbered: boolean; number: number } {
+  const match = KIKAKU_CATALOG_ENTRY_PATTERN.exec(title);
+  if (match === null) {
+    throw new AppError(
+      "planning_catalog_entry_heading_invalid",
+      `planning db catalog entry heading must match "No.<n> ｜ title" or "No.なし-<n> ｜ title", got "${title}"`,
+      3
+    );
+  }
+  if (match[1] !== undefined) {
+    return { numbered: true, number: Number(match[1]) };
+  }
+  return { numbered: false, number: Number(match[2]) };
+}
+
 function scanMarkdownHeadings(lines: string[]): MarkdownHeading[] {
   const headings: MarkdownHeading[] = [];
   let fenceMarker: "```" | "~~~" | null = null;
@@ -478,7 +763,7 @@ function scanMarkdownHeadings(lines: string[]): MarkdownHeading[] {
   return headings;
 }
 
-function splitContentLines(markdown: string): string[] {
+export function splitContentLines(markdown: string): string[] {
   const lines = markdown.split("\n");
   if (lines[lines.length - 1] === "") {
     lines.pop();
@@ -612,7 +897,24 @@ function twoDigits(value: number): string {
   return String(value).padStart(2, "0");
 }
 
-function assertUniqueSectionIds(sections: BusinessKnowledgeSection[]): void {
+function threeDigits(value: number): string {
+  return String(value).padStart(3, "0");
+}
+
+/** Structural subset shared with editorKnowledge.ts, see parsePlanningPlaybook. */
+export interface SectionIdentity {
+  documentId: string;
+  sectionId: string;
+}
+
+/** Structural subset shared with editorKnowledge.ts, see parsePlanningPlaybook. */
+export interface SectionStorageContent extends SectionIdentity {
+  directMarkdown: string;
+  sectionMarkdown: string;
+  retrievalText: string;
+}
+
+export function assertUniqueSectionIds(sections: SectionIdentity[]): void {
   const ids = new Set<string>();
   for (const section of sections) {
     if (ids.has(section.sectionId)) {
@@ -626,9 +928,9 @@ function assertUniqueSectionIds(sections: BusinessKnowledgeSection[]): void {
   }
 }
 
-function assertStorageLimits(
+export function assertStorageLimits(
   markdown: string,
-  sections: BusinessKnowledgeSection[]
+  sections: SectionStorageContent[]
 ): void {
   assertMediumText("document markdown", markdown);
   for (const section of sections) {

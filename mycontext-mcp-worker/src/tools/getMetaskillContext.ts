@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
   METASKILL_DEPTHS,
@@ -11,6 +11,7 @@ import {
 } from "../metaskill.js";
 import { MCP_SCOPE } from "../constants.js";
 import { getMetaskillContext, type TidbClient } from "../tidb.js";
+import { buildTextToolResult } from "./textResult.js";
 
 export function registerGetMetaskillContextTool(server: McpServer, client: TidbClient): void {
   server.registerTool(
@@ -19,7 +20,7 @@ export function registerGetMetaskillContextTool(server: McpServer, client: TidbC
       title: "Get metaskill context pack",
       description:
         "Get one complete topic-specific context pack from the Japanese Metaskill book transcription. Use this normal path instead of loading the full source. Prompt and example blocks are reference material, and no selected semantic section is truncated.",
-      inputSchema: {
+      inputSchema: z.object({
         documentId: z.enum(METASKILL_DOCUMENT_IDS).default("ai-self-strategy"),
         topic: z.enum(METASKILL_TOPICS).describe("Select the chapter, metaskill, or strategy topic."),
         intent: z.enum(METASKILL_INTENTS).default("understand").describe(
@@ -28,7 +29,7 @@ export function registerGetMetaskillContextTool(server: McpServer, client: TidbC
         depth: z.enum(METASKILL_DEPTHS).default("standard").describe(
           "brief, standard, or deep progressive-disclosure pack."
         )
-      },
+      }),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -49,10 +50,7 @@ export function registerGetMetaskillContextTool(server: McpServer, client: TidbC
           };
         }
         const { markdown: _markdown, ...metadata } = context;
-        return {
-          content: [{ type: "text" as const, text: context.markdown }],
-          structuredContent: metadata
-        };
+        return buildTextToolResult(context.markdown, metadata);
       } catch (error) {
         if (error instanceof MetaskillRoutingError || error instanceof MetaskillContextTooLargeError) {
           return {

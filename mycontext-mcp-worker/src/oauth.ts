@@ -33,6 +33,27 @@ interface GitHubTokenResponse {
   error?: string;
 }
 
+export class AuthorizationRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthorizationRequestError";
+  }
+}
+
+const SDK_UNKNOWN_CLIENT_ERROR_MESSAGE =
+  "Invalid client. The clientId provided does not match to this client.";
+
+// workers-oauth-provider@0.8.1 exposes its parseAuthRequest validation failures as plain
+// Error instances, the same type used for unexpected lookup/KV failures. Keep this list closed
+// so only the SDK's known request-validation errors become HTTP 400; unknown errors remain 500.
+const SDK_AUTHORIZATION_REQUEST_ERROR_MESSAGES = new Set([
+  "Invalid redirect URI",
+  "Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.",
+  "The resource parameter must be a valid absolute URI without a fragment",
+  "The implicit grant flow is not enabled for this provider",
+  "The plain PKCE method is not allowed. Use S256 instead."
+]);
+
 export const defaultHandler: ExportedHandler<Env> = {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
@@ -53,7 +74,13 @@ export const defaultHandler: ExportedHandler<Env> = {
       if (url.pathname === "/healthz") {
         return new Response("ok", {
           status: 200,
-          headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            ...(env.CF_VERSION_METADATA?.id === undefined
+              ? {}
+              : { "x-worker-version-id": env.CF_VERSION_METADATA.id })
+          }
         });
       }
 
@@ -75,6 +102,14 @@ export const defaultHandler: ExportedHandler<Env> = {
         return jsonResponse({ error: "server_misconfigured" }, 500);
       }
 
+      if (error instanceof Error && error.message === SDK_UNKNOWN_CLIENT_ERROR_MESSAGE) {
+        return missingClientRegistrationPage();
+      }
+
+      if (error instanceof AuthorizationRequestError || isSdkAuthorizationRequestError(error)) {
+        return oauthErrorPage("Invalid authorization request.", 400);
+      }
+
       console.error("oauth_handler_error", error instanceof Error ? error.name : "unknown");
       return jsonResponse({ error: "authorization_failed" }, 500);
     }
@@ -86,7 +121,7 @@ async function showAuthorizationPage(request: Request, env: Env): Promise<Respon
   validateRequestedScope(oauthRequest);
   const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
   if (client === null) {
-    return oauthErrorPage("Unknown OAuth client", 400);
+    return missingClientRegistrationPage();
   }
 
   const csrfToken = randomToken();
@@ -108,7 +143,7 @@ async function beginGitHubAuthorization(request: Request, env: Env): Promise<Res
   validateRequestedScope(oauthRequest);
   const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
   if (client === null) {
-    return oauthErrorPage("Unknown OAuth client", 400);
+    return missingClientRegistrationPage();
   }
 
   const config = loadAuthConfig(env);
@@ -225,8 +260,12 @@ export function validateRequestedScope(request: AuthRequest): void {
     !request.scope.includes(MCP_SCOPE) ||
     request.scope.some((scope) => !ALLOWED_SCOPES.has(scope))
   ) {
-    throw new Error("Unsupported OAuth scope");
+    throw new AuthorizationRequestError("Unsupported OAuth scope");
   }
+}
+
+function isSdkAuthorizationRequestError(error: unknown): boolean {
+  return error instanceof Error && SDK_AUTHORIZATION_REQUEST_ERROR_MESSAGES.has(error.message);
 }
 
 function renderConsentPage(request: AuthRequest, client: ClientInfo, csrfToken: string): string {
@@ -317,6 +356,13 @@ function htmlResponse(html: string, status: number, extraHeaders: Record<string,
 
 function oauthErrorPage(message: string, status: number): Response {
   return htmlResponse(`<!doctype html><meta charset="utf-8"><title>Authorization error</title><p>${escapeHtml(message)}</p>`, status);
+}
+
+function missingClientRegistrationPage(): Response {
+  return oauthErrorPage(
+    "OAuth client registration is missing or expired. Remove and recreate the MCP connection in your client, then start authorization again.",
+    400
+  );
 }
 
 function oauthChallengeResponse(): Response {

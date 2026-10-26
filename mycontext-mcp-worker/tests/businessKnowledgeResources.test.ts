@@ -1,6 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport, McpServer } from "@modelcontextprotocol/server";
 import { describe, expect, it, vi } from "vitest";
 import {
   BUSINESS_KNOWLEDGE_SECTION_URI_TEMPLATE,
@@ -9,7 +8,7 @@ import {
 import type { TidbClient } from "../src/tidb.js";
 
 describe("business knowledge MCP resources", () => {
-  it("lists the two source documents and active delivery sections, then reads a section", async () => {
+  it("lists all source documents and active delivery sections, then reads a section", async () => {
     const execute = vi.fn(async (sql: string, params?: readonly unknown[]) => {
       if (sql.includes("sections.section_id = sections.delivery_section_id")) {
         return [sectionRow(), marketingSectionRow()];
@@ -37,6 +36,7 @@ describe("business knowledge MCP resources", () => {
       expect(listed.resources.map((resource) => resource.uri)).toEqual(expect.arrayContaining([
         "mycontext://business-knowledge/startup-science",
         "mycontext://business-knowledge/marketing-wisdom",
+        "mycontext://business-knowledge/example-business-guide",
         "mycontext://business-knowledge/startup-science/sections/detail-18",
         "mycontext://business-knowledge/marketing-wisdom/sections/section-25"
       ]));

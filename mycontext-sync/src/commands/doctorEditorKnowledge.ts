@@ -70,7 +70,11 @@ export async function runDoctorEditorKnowledge(_flags: CliFlags): Promise<void> 
   }
 
   const failed = results.some((result) => result.status !== "ok");
-  console.log(JSON.stringify({ status: failed ? "failed" : "ok", documents: results }, null, 2));
+  console.log(JSON.stringify(
+    { status: failed ? "failed" : "ok", documents: results },
+    null,
+    2
+  ));
   if (failed) {
     process.exitCode = 2;
   }

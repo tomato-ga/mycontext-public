@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { METASKILL_DOCUMENT_IDS } from "../metaskill.js";
 import { MCP_SCOPE } from "../constants.js";
@@ -8,6 +8,7 @@ import {
   validateTopK,
   type TidbClient
 } from "../tidb.js";
+import { buildTextToolResult } from "./textResult.js";
 
 export function registerSearchMetaskillEvidenceTool(server: McpServer, client: TidbClient): void {
   server.registerTool(
@@ -16,11 +17,11 @@ export function registerSearchMetaskillEvidenceTool(server: McpServer, client: T
       title: "Search metaskill evidence",
       description:
         "Search fine-grained spans in the Metaskill transcription, then return each complete semantic delivery section. Use for a specific term, example, prompt, or supporting passage.",
-      inputSchema: {
+      inputSchema: z.object({
         documentId: z.enum(METASKILL_DOCUMENT_IDS).default("ai-self-strategy"),
         query: z.string().trim().min(1).max(1_000),
         topK: z.number().optional().describe("Integer from 1 to 5; defaults to 3.")
-      },
+      }),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -46,10 +47,7 @@ export function registerSearchMetaskillEvidenceTool(server: McpServer, client: T
               "",
               hit.markdown
             ].join("\n")).join("\n\n---\n\n");
-        return {
-          content: [{ type: "text" as const, text }],
-          structuredContent: { query, document_id: documentId, hits: metadata }
-        };
+        return buildTextToolResult(text, { query, document_id: documentId, hits: metadata });
       } catch (error) {
         if (error instanceof TopKValidationError) {
           return {

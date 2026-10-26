@@ -1,8 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import {
-  AUTHOR_STYLE_SOURCES,
-  authorStyleSourceRootFromEnv,
-  loadAuthorStyleDocument
+  AUTHOR_STYLE_DOCUMENTS,
+  parseAuthorStyleMarkdown
 } from "../authorStyle.js";
 import {
   buildAuthorStyleContext,
@@ -17,85 +16,62 @@ type DoctorStatus =
   | "ok"
   | "source_invalid"
   | "missing_tidb_document"
-  | "missing_active_revision"
   | "document_mismatch"
-  | "revision_mismatch"
+  | "snapshot_mismatch"
   | "section_count_mismatch"
   | "section_mismatch"
   | "routing_invalid";
 
 export async function runDoctorAuthorStyle(_flags: CliFlags): Promise<void> {
-  const sourceRoot = authorStyleSourceRootFromEnv();
   const client = createTidbClientFromEnv();
   const results: Array<Record<string, unknown>> = [];
 
   try {
     await client.ping();
-    for (const source of AUTHOR_STYLE_SOURCES) {
+    for (const source of AUTHOR_STYLE_DOCUMENTS) {
       try {
-        const local = await loadAuthorStyleDocument(sourceRoot, source);
         const storedDocument = await client.getAuthorStyleDocument(source.documentId);
         if (storedDocument === null) {
           results.push({
             documentId: source.documentId,
             status: "missing_tidb_document" satisfies DoctorStatus,
-            expectedSections: local.sectionCount,
             warnings: []
           });
           continue;
         }
-        if (storedDocument.active_revision_sha256 === null) {
-          results.push({
-            documentId: source.documentId,
-            status: "missing_active_revision" satisfies DoctorStatus,
-            warnings: []
-          });
-          continue;
-        }
-        const storedRevision = await client.getAuthorStyleRevision(
-          source.documentId,
-          storedDocument.active_revision_sha256
-        );
-        if (storedRevision === null) {
-          results.push({
-            documentId: source.documentId,
-            status: "missing_active_revision" satisfies DoctorStatus,
-            activeRevisionSha256: storedDocument.active_revision_sha256,
-            warnings: []
-          });
-          continue;
-        }
-        const rows = await client.listAuthorStyleSections(
-          source.documentId,
-          storedDocument.active_revision_sha256
-        );
+        const reparsed = parseAuthorStyleMarkdown({
+          source,
+          markdown: storedDocument.source_markdown,
+          sourcePathKey: storedDocument.source_path_key,
+          sourceMtimeMs: Number(storedDocument.source_mtime_ms)
+        });
+        const rows = await client.listAuthorStyleSections(source.documentId);
 
-        const documentMatches = storedDocument.author_key === local.authorKey
-          && storedDocument.style_scope === local.styleScope
-          && storedDocument.display_name === local.displayName
-          && storedDocument.source_path_key === local.sourcePathKey
-          && storedDocument.active_revision_sha256 === local.revisionSha256
+        const documentMatches = storedDocument.author_key === reparsed.authorKey
+          && storedDocument.style_scope === reparsed.styleScope
+          && storedDocument.display_name === reparsed.displayName
+          && storedDocument.source_path_key === reparsed.sourcePathKey
+          && storedDocument.source_path_key.startsWith("notion:")
           && storedDocument.status === "active";
-        const revisionMatches = storedRevision.revision_sha256 === local.revisionSha256
-          && storedRevision.source_markdown === local.sourceMarkdown
-          && storedRevision.source_markdown_sha256 === local.sourceMarkdownSha256
-          && sha256(storedRevision.source_markdown) === storedRevision.source_markdown_sha256
-          && Number(storedRevision.source_bytes) === local.sourceBytes
-          && Number(storedRevision.source_line_count) === local.sourceLineCount
-          && storedRevision.parser_version === local.parserVersion
-          && storedRevision.sectioning_version === local.sectioningVersion
-          && storedRevision.routing_version === local.routingVersion
-          && jsonEquivalent(storedRevision.routing_manifest_json, local.routingManifest)
-          && jsonEquivalent(storedRevision.outline_json, local.outline)
-          && Number(storedRevision.section_count) === local.sectionCount
-          && Number(storedRevision.delivery_section_count) === local.deliverySectionCount
-          && Number(storedRevision.search_span_count) === local.searchSpanCount;
+        const snapshotMatches = storedDocument.context_sha256 === reparsed.revisionSha256
+          && storedDocument.source_markdown === reparsed.sourceMarkdown
+          && storedDocument.source_markdown_sha256 === reparsed.sourceMarkdownSha256
+          && sha256(storedDocument.source_markdown) === storedDocument.source_markdown_sha256
+          && Number(storedDocument.source_bytes) === reparsed.sourceBytes
+          && Number(storedDocument.source_line_count) === reparsed.sourceLineCount
+          && storedDocument.parser_version === reparsed.parserVersion
+          && storedDocument.sectioning_version === reparsed.sectioningVersion
+          && storedDocument.routing_version === reparsed.routingVersion
+          && jsonEquivalent(storedDocument.routing_manifest_json, reparsed.routingManifest)
+          && jsonEquivalent(storedDocument.outline_json, reparsed.outline)
+          && Number(storedDocument.section_count) === reparsed.sectionCount
+          && Number(storedDocument.delivery_section_count) === reparsed.deliverySectionCount
+          && Number(storedDocument.search_span_count) === reparsed.searchSpanCount;
 
-        const localById = new Map(local.sections.map((section) => [section.sectionId, section]));
+        const reparsedById = new Map(reparsed.sections.map((section) => [section.sectionId, section]));
         const sectionsMatch = rows.every((row) => {
-          const expected = localById.get(row.section_id);
+          const expected = reparsedById.get(row.section_id);
           return expected !== undefined
-            && row.revision_sha256 === expected.revisionSha256
             && row.context_key === expected.contextKey
             && row.parent_section_id === expected.parentSectionId
             && row.delivery_section_id === expected.deliverySectionId
@@ -125,8 +101,8 @@ export async function runDoctorAuthorStyle(_flags: CliFlags): Promise<void> {
         let routingCombinations = 0;
         let routingWarning: string | null = null;
         try {
-          const manifest = parseAuthorStyleRoutingManifest(local.routingManifest);
-          const contextSections = new Map(local.sections.flatMap((section) => {
+          const manifest = parseAuthorStyleRoutingManifest(reparsed.routingManifest);
+          const contextSections = new Map(reparsed.sections.flatMap((section) => {
             return section.contextKey === null ? [] : [[section.contextKey, {
               contextKey: section.contextKey,
               title: section.title,
@@ -135,9 +111,9 @@ export async function runDoctorAuthorStyle(_flags: CliFlags): Promise<void> {
           }));
           for (const selectors of enumerateAuthorStyleSelectors(manifest)) {
             const context = buildAuthorStyleContext({
-              documentId: local.documentId,
-              displayName: local.displayName,
-              revisionSha256: local.revisionSha256,
+              documentId: reparsed.documentId,
+              displayName: reparsed.displayName,
+              revisionSha256: reparsed.revisionSha256,
               manifest,
               selectors,
               sections: contextSections
@@ -157,33 +133,30 @@ export async function runDoctorAuthorStyle(_flags: CliFlags): Promise<void> {
 
         const status: DoctorStatus = !documentMatches
           ? "document_mismatch"
-          : !revisionMatches
-            ? "revision_mismatch"
-            : rows.length !== local.sectionCount
+          : !snapshotMatches
+            ? "snapshot_mismatch"
+            : rows.length !== reparsed.sectionCount
               ? "section_count_mismatch"
               : !sectionsMatch
                 ? "section_mismatch"
                 : routingStatus;
         results.push({
           documentId: source.documentId,
-          displayName: local.displayName,
+          displayName: reparsed.displayName,
           status,
-          sourceMarkdownSha256: local.sourceMarkdownSha256,
-          activeRevisionSha256: storedDocument.active_revision_sha256,
-          expectedSections: local.sectionCount,
+          sourceMarkdownSha256: reparsed.sourceMarkdownSha256,
+          contextSha256: storedDocument.context_sha256,
+          expectedSections: reparsed.sectionCount,
           storedSections: rows.length,
-          expectedDeliverySections: local.deliverySectionCount,
+          expectedDeliverySections: reparsed.deliverySectionCount,
           storedDeliverySections: rows.filter((row) => row.section_type === "delivery").length,
-          expectedSearchSpans: local.searchSpanCount,
+          expectedSearchSpans: reparsed.searchSpanCount,
           storedSearchSpans: rows.filter((row) => row.section_type === "search_span").length,
           routingCombinations,
           minimumContextChars,
           maximumContextChars,
-          maxContextChars: parseAuthorStyleRoutingManifest(local.routingManifest).maxContextChars,
-          sourceMtimeMs: local.sourceMtimeMs,
-          storedSourceMtimeMs: Number(storedRevision.source_mtime_ms),
-          sourceMtimeChangedWithoutContent:
-            Number(storedRevision.source_mtime_ms) !== local.sourceMtimeMs,
+          maxContextChars: parseAuthorStyleRoutingManifest(reparsed.routingManifest).maxContextChars,
+          sourceMtimeMs: reparsed.sourceMtimeMs,
           warnings: routingWarning === null ? [] : [routingWarning]
         });
       } catch (error) {

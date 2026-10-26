@@ -10,6 +10,19 @@ import {
 } from "./authorStyle.js";
 import { buildBusinessKnowledgeSectionUri } from "./businessKnowledge.js";
 import {
+  buildEditingPlaybookResourceUri,
+  DEFAULT_EDITING_PLAYBOOK_VERSION,
+  editingPlaybookDocumentId,
+  editingPlaybookSourceId,
+  type EditingPlaybookVersion,
+  EditingPlaybookContextError,
+  EditingPlaybookContextTooLargeError,
+  MAX_EDITING_PLAYBOOK_CONTEXT_CHARS,
+  type EditingPlaybookContext
+} from "./editingPlaybook.js";
+import { resolveEditorTrainingSearchIntent } from "./editorTrainingSearchIntent.js";
+import { buildEditorKnowledgeSectionUri } from "./editorKnowledge.js";
+import {
   MetaskillContextTooLargeError,
   buildMetaskillDocumentUri,
   buildMetaskillSectionUri,
@@ -19,9 +32,48 @@ import {
   type MetaskillDocumentId,
   type MetaskillSelectors
 } from "./metaskill.js";
-import { buildSearchQueryPlan, normalizeSearchText } from "./searchQuery.js";
+import {
+  buildKoseiPlaybookResourceUri,
+  KOSEI_PLAYBOOK_DOCUMENT_ID,
+  KOSEI_PLAYBOOK_SOURCE_ID,
+  KoseiPlaybookContextError,
+  KoseiPlaybookContextTooLargeError,
+  MAX_KOSEI_PLAYBOOK_CONTEXT_CHARS,
+  type KoseiPlaybookContext
+} from "./koseiPlaybook.js";
+import {
+  buildMediaPlaybookResourceUri,
+  MAX_MEDIA_PLAYBOOK_CONTEXT_CHARS,
+  MEDIA_PLAYBOOK_DOCUMENT_ID,
+  MEDIA_PLAYBOOK_SOURCE_ID,
+  MediaPlaybookContextError,
+  MediaPlaybookContextTooLargeError,
+  type MediaPlaybookContext
+} from "./mediaPlaybook.js";
+import {
+  buildSearchQueryPlan,
+  normalizeSearchText,
+  EMPTY_PERSONAL_SYNONYM_CONFIG,
+  type PersonalSynonymConfig
+} from "./searchQuery.js";
+import { getSkillContextDocument } from "./skillContext.js";
+import { resolveSkillContextSearchIntent } from "./skillContextSearchIntent.js";
+import {
+  buildPlanningPlaybookResourceUri,
+  MAX_PLANNING_PLAYBOOK_CONTEXT_CHARS,
+  PLANNING_PLAYBOOK_DOCUMENT_ID,
+  PLANNING_PLAYBOOK_SOURCE_ID,
+  PlanningPlaybookContextError,
+  PlanningPlaybookContextTooLargeError,
+  type PlanningPlaybookContext
+} from "./planningPlaybook.js";
+import { resolvePlaybookSearchIntent } from "./playbookSearchIntent.js";
 
-export type DocumentSource = "notion" | "editor_knowledge" | "business_knowledge";
+export type DocumentSource =
+  | "notion"
+  | "editor_knowledge"
+  | "business_knowledge"
+  | "skill_context";
 
 export interface ListedDocument {
   document_id: string;
@@ -48,7 +100,7 @@ export interface SearchContextHit {
   match_position: number;
   matched_terms: string[];
   score: number;
-  search_stage: "phrase" | "keywords" | "synonyms";
+  search_stage: "intent" | "phrase" | "keywords" | "synonyms";
   matched_span_position?: number;
   matched_section_id?: string;
   matched_section_title?: string;
@@ -261,6 +313,32 @@ export interface ListedBusinessKnowledgeResource {
   resource_uri: string;
 }
 
+export interface EditorKnowledgeResource {
+  document_id: string;
+  section_id: string;
+  title: string;
+  heading_path: string[];
+  content_layer: string;
+  markdown: string;
+  source_line_start: number;
+  source_line_end: number;
+  related_source_path: string | null;
+  freshness_class: string | null;
+  resource_uri: string;
+}
+
+export interface ListedEditorKnowledgeResource {
+  document_id: string;
+  section_id: string;
+  title: string;
+  heading_path: string[];
+  content_layer: string;
+  size_bytes: number;
+  related_source_path: string | null;
+  freshness_class: string | null;
+  resource_uri: string;
+}
+
 export class DataShapeError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -307,9 +385,9 @@ const DOCUMENT_READ_MODEL_SQL = `SELECT
         NULL AS ingest_scope,
         NULL AS source_declared_at,
         NULL AS detail_available,
-        NULL AS section_revision_sha256,
-        NULL AS section_count,
-        NULL AS search_span_count,
+        section_revision_sha256,
+        section_count,
+        search_span_count,
         FALSE AS source_truncated,
         JSON_ARRAY() AS unknown_block_ids,
         last_synced_at
@@ -384,13 +462,54 @@ export async function listDocuments(client: TidbClient): Promise<ListedDocument[
   }));
 }
 
-export async function searchContext(client: TidbClient, query: string, topK: number): Promise<SearchContextHit[]> {
+export async function searchContext(
+  client: TidbClient,
+  query: string,
+  topK: number,
+  personalSynonyms: PersonalSynonymConfig = EMPTY_PERSONAL_SYNONYM_CONFIG
+): Promise<SearchContextHit[]> {
   const limitedTopK = validateTopK(topK);
-  const plan = buildSearchQueryPlan(query);
+  const skillIntent = resolveSkillContextSearchIntent(query);
+  if (skillIntent !== null) {
+    const skillContext = await getSkillContextDocument(client, skillIntent.skillId);
+    if (skillContext !== null) {
+      return [{
+        document_id: skillIntent.documentId,
+        source: "skill_context",
+        title: skillContext.title,
+        text: skillContext.markdown,
+        match_position: 1,
+        matched_terms: [skillIntent.skillId],
+        score: 1000,
+        search_stage: "intent",
+        resource_uri: skillIntent.resourceUri
+      }];
+    }
+  }
+  const canonicalIntent =
+    resolvePlaybookSearchIntent(query) ??
+    resolveEditorTrainingSearchIntent(query);
+  if (canonicalIntent !== null) {
+    const document = await getDocument(client, canonicalIntent.documentId);
+    if (document !== null) {
+      return [{
+        document_id: document.document_id,
+        source: document.source,
+        title: document.title,
+        text: document.markdown,
+        match_position: 1,
+        matched_terms: [canonicalIntent.canonicalTitle],
+        score: 1000,
+        search_stage: "intent",
+        resource_uri: canonicalIntent.resourceUri
+      }];
+    }
+  }
+  const plan = buildSearchQueryPlan(query, personalSynonyms);
   const likePattern = buildLikePattern(plan.phrase);
   const phraseRows = await client.execute(
     buildSearchSql(limitedTopK),
-    [plan.phrase, plan.phrase, likePattern, plan.phrase, likePattern]
+    [plan.phrase, plan.phrase, likePattern, plan.phrase, plan.phrase, likePattern, plan.phrase, likePattern]
   );
   if (phraseRows.length > 0) {
     return phraseRows.map((row) =>
@@ -437,8 +556,13 @@ export async function searchContext(client: TidbClient, query: string, topK: num
   );
 }
 
-export async function searchText(client: TidbClient, query: string, topK: number): Promise<SearchTextHit[]> {
-  return searchContext(client, query, topK);
+export async function searchText(
+  client: TidbClient,
+  query: string,
+  topK: number,
+  personalSynonyms: PersonalSynonymConfig = EMPTY_PERSONAL_SYNONYM_CONFIG
+): Promise<SearchTextHit[]> {
+  return searchContext(client, query, topK, personalSynonyms);
 }
 
 export async function getDocument(client: TidbClient, documentId: string): Promise<FullDocument | null> {
@@ -488,6 +612,256 @@ export async function getDocument(client: TidbClient, documentId: string): Promi
     source_truncated: parseBoolean(row.source_truncated, "source_truncated"),
     unknown_block_ids: parseStringArray(row.unknown_block_ids, "unknown_block_ids"),
     last_synced_at: dateToIsoString(row.last_synced_at)
+  };
+}
+
+export async function getPlanningPlaybookContext(
+  client: TidbClient
+): Promise<PlanningPlaybookContext | null> {
+  const rows = await client.execute(
+    `SELECT
+        document_id,
+        title,
+        markdown,
+        markdown_sha256,
+        section_revision_sha256,
+        section_count,
+        search_span_count,
+        last_synced_at
+      FROM editor_knowledge_documents
+      WHERE document_id = ?
+      LIMIT 1`,
+    [PLANNING_PLAYBOOK_SOURCE_ID]
+  );
+
+  const row = rows[0];
+  if (row === undefined) {
+    return null;
+  }
+
+  try {
+    const documentId = parseRequiredString(row.document_id, "document_id");
+    if (documentId !== PLANNING_PLAYBOOK_SOURCE_ID) {
+      throw new PlanningPlaybookContextError(
+        `planning playbook document_id must be ${PLANNING_PLAYBOOK_SOURCE_ID}`
+      );
+    }
+    const markdown = parseRequiredString(row.markdown, "markdown");
+    if (markdown.length > MAX_PLANNING_PLAYBOOK_CONTEXT_CHARS) {
+      throw new PlanningPlaybookContextTooLargeError(
+        markdown.length,
+        MAX_PLANNING_PLAYBOOK_CONTEXT_CHARS
+      );
+    }
+    const revisionSha256 = parseRequiredString(
+      row.section_revision_sha256,
+      "section_revision_sha256"
+    );
+    const sectionCount = parseNumber(row.section_count, "section_count");
+    const searchSpanCount = parseNumber(row.search_span_count, "search_span_count");
+    if (!Number.isInteger(sectionCount) || sectionCount < 1) {
+      throw new PlanningPlaybookContextError("planning playbook section_count must be positive");
+    }
+    if (searchSpanCount !== sectionCount) {
+      throw new PlanningPlaybookContextError(
+        `planning playbook must make every chapter searchable: section_count=${sectionCount}, search_span_count=${searchSpanCount}`
+      );
+    }
+
+    return {
+      document_id: PLANNING_PLAYBOOK_DOCUMENT_ID,
+      title: parseRequiredString(row.title, "title"),
+      markdown_sha256: parseRequiredString(row.markdown_sha256, "markdown_sha256"),
+      revision_sha256: revisionSha256,
+      section_count: sectionCount,
+      search_span_count: searchSpanCount,
+      context_chars: markdown.length,
+      retrieval_mode: "full_playbook",
+      truncated: false,
+      last_synced_at: dateToIsoString(row.last_synced_at),
+      source_resource_uri: buildPlanningPlaybookResourceUri(),
+      markdown
+    };
+  } catch (error) {
+    if (
+      error instanceof PlanningPlaybookContextError
+      || error instanceof PlanningPlaybookContextTooLargeError
+    ) {
+      throw error;
+    }
+    throw new PlanningPlaybookContextError(
+      `planning playbook state is invalid: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+export async function getEditingPlaybookContext(
+  client: TidbClient,
+  version: EditingPlaybookVersion = DEFAULT_EDITING_PLAYBOOK_VERSION
+): Promise<EditingPlaybookContext | null> {
+  try {
+    const context = await getWholeDocumentPlaybookContext(client, {
+      sourceId: editingPlaybookSourceId(version),
+      maximumChars: MAX_EDITING_PLAYBOOK_CONTEXT_CHARS,
+      invalidState: (message) => new EditingPlaybookContextError(message),
+      tooLarge: (actual, maximum) =>
+        new EditingPlaybookContextTooLargeError(actual, maximum)
+    });
+    return context === null ? null : {
+      ...context,
+      document_id: editingPlaybookDocumentId(version),
+      source_resource_uri: buildEditingPlaybookResourceUri(version)
+    };
+  } catch (error) {
+    if (
+      error instanceof EditingPlaybookContextError
+      || error instanceof EditingPlaybookContextTooLargeError
+    ) {
+      throw error;
+    }
+    throw new EditingPlaybookContextError(
+      `editing playbook state is invalid: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+export async function getMediaPlaybookContext(
+  client: TidbClient
+): Promise<MediaPlaybookContext | null> {
+  try {
+    const context = await getWholeDocumentPlaybookContext(client, {
+      sourceId: MEDIA_PLAYBOOK_SOURCE_ID,
+      maximumChars: MAX_MEDIA_PLAYBOOK_CONTEXT_CHARS,
+      invalidState: (message) => new MediaPlaybookContextError(message),
+      tooLarge: (actual, maximum) =>
+        new MediaPlaybookContextTooLargeError(actual, maximum)
+    });
+    return context === null ? null : {
+      ...context,
+      document_id: MEDIA_PLAYBOOK_DOCUMENT_ID,
+      source_resource_uri: buildMediaPlaybookResourceUri()
+    };
+  } catch (error) {
+    if (
+      error instanceof MediaPlaybookContextError
+      || error instanceof MediaPlaybookContextTooLargeError
+    ) {
+      throw error;
+    }
+    throw new MediaPlaybookContextError(
+      `media playbook state is invalid: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+export async function getKoseiPlaybookContext(
+  client: TidbClient
+): Promise<KoseiPlaybookContext | null> {
+  try {
+    const context = await getWholeDocumentPlaybookContext(client, {
+      sourceId: KOSEI_PLAYBOOK_SOURCE_ID,
+      maximumChars: MAX_KOSEI_PLAYBOOK_CONTEXT_CHARS,
+      invalidState: (message) => new KoseiPlaybookContextError(message),
+      tooLarge: (actual, maximum) =>
+        new KoseiPlaybookContextTooLargeError(actual, maximum)
+    });
+    return context === null ? null : {
+      ...context,
+      document_id: KOSEI_PLAYBOOK_DOCUMENT_ID,
+      source_resource_uri: buildKoseiPlaybookResourceUri()
+    };
+  } catch (error) {
+    if (
+      error instanceof KoseiPlaybookContextError
+      || error instanceof KoseiPlaybookContextTooLargeError
+    ) {
+      throw error;
+    }
+    throw new KoseiPlaybookContextError(
+      `kosei playbook state is invalid: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+interface WholeDocumentPlaybookContextRow {
+  title: string;
+  markdown_sha256: string;
+  revision_sha256: string;
+  storage_mode: "whole_document";
+  record_count: 1;
+  section_count: 0;
+  search_span_count: 1;
+  context_chars: number;
+  retrieval_mode: "full_playbook";
+  truncated: false;
+  last_synced_at: string | null;
+  markdown: string;
+}
+
+async function getWholeDocumentPlaybookContext(
+  client: TidbClient,
+  config: {
+    sourceId: string;
+    maximumChars: number;
+    invalidState: (message: string) => Error;
+    tooLarge: (actual: number, maximum: number) => Error;
+  }
+): Promise<WholeDocumentPlaybookContextRow | null> {
+  const rows = await client.execute(
+    `SELECT
+        document_id,
+        title,
+        markdown,
+        markdown_sha256,
+        section_revision_sha256,
+        section_count,
+        search_span_count,
+        last_synced_at
+      FROM editor_knowledge_documents
+      WHERE document_id = ?
+      LIMIT 1`,
+    [config.sourceId]
+  );
+
+  const row = rows[0];
+  if (row === undefined) {
+    return null;
+  }
+
+  const documentId = parseRequiredString(row.document_id, "document_id");
+  if (documentId !== config.sourceId) {
+    throw config.invalidState(
+      `whole-document playbook document_id must be ${config.sourceId}`
+    );
+  }
+  const markdown = parseRequiredString(row.markdown, "markdown");
+  if (markdown.length > config.maximumChars) {
+    throw config.tooLarge(markdown.length, config.maximumChars);
+  }
+  if (
+    row.section_revision_sha256 !== null
+    || row.section_count !== null
+    || row.search_span_count !== null
+  ) {
+    throw config.invalidState(
+      "whole-document playbook must not have section revision/count metadata"
+    );
+  }
+
+  const markdownSha256 = parseRequiredString(row.markdown_sha256, "markdown_sha256");
+  return {
+    title: parseRequiredString(row.title, "title"),
+    markdown_sha256: markdownSha256,
+    revision_sha256: markdownSha256,
+    storage_mode: "whole_document",
+    record_count: 1,
+    section_count: 0,
+    search_span_count: 1,
+    context_chars: markdown.length,
+    retrieval_mode: "full_playbook",
+    truncated: false,
+    last_synced_at: dateToIsoString(row.last_synced_at),
+    markdown
   };
 }
 
@@ -553,6 +927,82 @@ export async function getBusinessKnowledgeSection(
   return rows[0] === undefined ? null : parseBusinessKnowledgeResource(rows[0]);
 }
 
+export interface EditorKnowledgeDocumentSummary {
+  document_id: string;
+  title: string;
+}
+
+/**
+ * Generic across the whole editor_knowledge_documents table — not limited to
+ * planning-playbook/planning-catalog. Used to enumerate the open-ended
+ * planning-fulltext-* family (and any future Editor Knowledge document) for the
+ * mycontext://editor-knowledge/{documentId} resource template's list callback, so a new
+ * document only needs a row in TiDB, not a code change here.
+ */
+export async function listEditorKnowledgeDocuments(
+  client: TidbClient
+): Promise<EditorKnowledgeDocumentSummary[]> {
+  const rows = await client.execute(
+    `SELECT document_id, title FROM editor_knowledge_documents ORDER BY document_id ASC`
+  );
+  return rows.map((row) => ({
+    document_id: parseRequiredString(row.document_id, "document_id"),
+    title: parseRequiredString(row.title, "title")
+  }));
+}
+
+export async function listEditorKnowledgeResources(
+  client: TidbClient
+): Promise<ListedEditorKnowledgeResource[]> {
+  const rows = await client.execute(
+    `SELECT
+        sections.document_id,
+        sections.section_id,
+        sections.title,
+        sections.heading_path_json,
+        sections.content_layer,
+        sections.related_source_path,
+        sections.freshness_class,
+        OCTET_LENGTH(sections.section_markdown) AS size_bytes
+      FROM editor_knowledge_sections AS sections
+      INNER JOIN editor_knowledge_documents AS documents
+        ON documents.document_id = sections.document_id
+       AND documents.section_revision_sha256 = sections.section_revision_sha256
+      WHERE sections.section_id = sections.delivery_section_id
+      ORDER BY sections.document_id ASC, sections.ordinal ASC, sections.section_id ASC`
+  );
+  return rows.map(parseListedEditorKnowledgeResource);
+}
+
+export async function getEditorKnowledgeSection(
+  client: TidbClient,
+  documentId: string,
+  sectionId: string
+): Promise<EditorKnowledgeResource | null> {
+  const rows = await client.execute(
+    `SELECT
+        sections.document_id,
+        sections.section_id,
+        sections.title,
+        sections.heading_path_json,
+        sections.content_layer,
+        sections.section_markdown,
+        sections.source_line_start,
+        sections.source_line_end,
+        sections.related_source_path,
+        sections.freshness_class
+      FROM editor_knowledge_sections AS sections
+      INNER JOIN editor_knowledge_documents AS documents
+        ON documents.document_id = sections.document_id
+       AND documents.section_revision_sha256 = sections.section_revision_sha256
+      WHERE sections.document_id = ?
+        AND sections.section_id = ?
+      LIMIT 1`,
+    [documentId, sectionId]
+  );
+  return rows[0] === undefined ? null : parseEditorKnowledgeResource(rows[0]);
+}
+
 export async function getAuthorStyleContext(
   client: TidbClient,
   selectors: AuthorStyleSelectors
@@ -561,13 +1011,10 @@ export async function getAuthorStyleContext(
     `SELECT
         documents.document_id,
         documents.display_name,
-        revisions.revision_sha256,
-        revisions.routing_version,
-        revisions.routing_manifest_json
+        documents.context_sha256 AS revision_sha256,
+        documents.routing_version,
+        documents.routing_manifest_json
       FROM author_style_documents AS documents
-      INNER JOIN author_style_revisions AS revisions
-        ON revisions.document_id = documents.document_id
-       AND revisions.revision_sha256 = documents.active_revision_sha256
       WHERE documents.document_id = ?
         AND documents.status = 'active'
       LIMIT 1`,
@@ -587,12 +1034,11 @@ export async function getAuthorStyleContext(
   const placeholders = contextKeys.map(() => "?").join(", ");
   const sectionRows = await client.execute(
     `SELECT section_id, context_key, title, delivery_markdown, ordinal
-      FROM author_style_sections
+      FROM author_style_current_sections
       WHERE document_id = ?
-        AND revision_sha256 = ?
         AND context_key IN (${placeholders})
       ORDER BY ordinal ASC`,
-    [documentId, revisionSha256, ...contextKeys]
+    [documentId, ...contextKeys]
   );
   const byContextKey = new Map(sectionRows.map((row) => {
     const contextKey = parseRequiredString(row.context_key, "context_key");
@@ -658,7 +1104,7 @@ export async function searchAuthorStyleEvidence(
     `WITH evidence_matches AS (
         SELECT
           documents.document_id,
-          documents.active_revision_sha256 AS revision_sha256,
+          documents.context_sha256 AS revision_sha256,
           matched.section_id AS matched_section_id,
           matched.title AS matched_section_title,
           matched.content_layer AS matched_content_layer,
@@ -679,12 +1125,10 @@ export async function searchAuthorStyleEvidence(
                      matched.section_id ASC
           ) AS delivery_match_rank
         FROM author_style_documents AS documents
-        INNER JOIN author_style_sections AS matched
+        INNER JOIN author_style_current_sections AS matched
           ON matched.document_id = documents.document_id
-         AND matched.revision_sha256 = documents.active_revision_sha256
-        INNER JOIN author_style_sections AS delivery
+        INNER JOIN author_style_current_sections AS delivery
           ON delivery.document_id = matched.document_id
-         AND delivery.revision_sha256 = matched.revision_sha256
          AND delivery.section_id = matched.delivery_section_id
         WHERE documents.document_id = ?
           AND documents.status = 'active'
@@ -714,13 +1158,10 @@ export async function getAuthorStyleDocumentResource(
     `SELECT
         documents.document_id,
         documents.display_name,
-        revisions.revision_sha256,
-        revisions.source_markdown_sha256,
-        revisions.source_markdown
+        documents.context_sha256 AS revision_sha256,
+        documents.source_markdown_sha256,
+        documents.source_markdown
       FROM author_style_documents AS documents
-      INNER JOIN author_style_revisions AS revisions
-        ON revisions.document_id = documents.document_id
-       AND revisions.revision_sha256 = documents.active_revision_sha256
       WHERE documents.document_id = ?
         AND documents.status = 'active'
       LIMIT 1`,
@@ -748,7 +1189,7 @@ export async function listAuthorStyleResources(
   const rows = await client.execute(
     `SELECT
         sections.document_id,
-        sections.revision_sha256,
+        documents.context_sha256 AS revision_sha256,
         sections.section_id,
         sections.context_key,
         sections.title,
@@ -756,9 +1197,8 @@ export async function listAuthorStyleResources(
         sections.content_layer,
         OCTET_LENGTH(sections.delivery_markdown) AS size_bytes
       FROM author_style_documents AS documents
-      INNER JOIN author_style_sections AS sections
+      INNER JOIN author_style_current_sections AS sections
         ON sections.document_id = documents.document_id
-       AND sections.revision_sha256 = documents.active_revision_sha256
       WHERE documents.status = 'active'
         AND sections.section_id = sections.delivery_section_id
         AND sections.context_key IS NOT NULL
@@ -775,7 +1215,7 @@ export async function getAuthorStyleSectionResource(
   const rows = await client.execute(
     `SELECT
         sections.document_id,
-        sections.revision_sha256,
+        documents.context_sha256 AS revision_sha256,
         sections.section_id,
         sections.context_key,
         sections.title,
@@ -786,9 +1226,8 @@ export async function getAuthorStyleSectionResource(
         sections.source_line_start,
         sections.source_line_end
       FROM author_style_documents AS documents
-      INNER JOIN author_style_sections AS sections
+      INNER JOIN author_style_current_sections AS sections
         ON sections.document_id = documents.document_id
-       AND sections.revision_sha256 = documents.active_revision_sha256
       WHERE documents.document_id = ?
         AND documents.status = 'active'
         AND sections.section_id = ?
@@ -1090,9 +1529,8 @@ export async function checkHealth(client: TidbClient): Promise<HealthCheckResult
             COALESCE(SUM(CASE WHEN sections.section_type = 'search_span' THEN 1 ELSE 0 END), 0)
               AS author_style_search_spans_count
           FROM author_style_documents AS documents
-          LEFT JOIN author_style_sections AS sections
+          LEFT JOIN author_style_current_sections AS sections
             ON sections.document_id = documents.document_id
-           AND sections.revision_sha256 = documents.active_revision_sha256
           WHERE documents.status = 'active'
         ),
         active_metaskill_health AS (
@@ -1253,6 +1691,56 @@ export function buildSearchSql(topK: number): string {
           ) AS delivery_match_rank
         FROM business_span_matches
       ),
+      editor_span_matches AS (
+        SELECT
+          CONCAT('editor-knowledge:', documents.document_id) AS document_id,
+          'editor_knowledge' AS source,
+          documents.document_id AS source_id,
+          documents.title,
+          delivery_sections.section_markdown AS markdown,
+          LOCATE(?, delivery_sections.section_markdown) AS match_position,
+          LOCATE(?, matched_sections.retrieval_text) AS matched_span_position,
+          matched_sections.section_id AS matched_section_id,
+          matched_sections.title AS matched_section_title,
+          matched_sections.content_layer AS matched_content_layer,
+          delivery_sections.section_id AS delivery_section_id,
+          delivery_sections.title AS delivery_section_title,
+          delivery_sections.content_layer AS delivery_content_layer,
+          matched_sections.heading_path_json,
+          matched_sections.source_line_start,
+          matched_sections.source_line_end,
+          delivery_sections.source_line_start AS delivery_line_start,
+          delivery_sections.source_line_end AS delivery_line_end,
+          matched_sections.related_source_path,
+          matched_sections.freshness_class,
+          NULL AS source_kind,
+          NULL AS ingest_scope,
+          NULL AS source_declared_at,
+          NULL AS detail_available,
+          documents.last_synced_at,
+          matched_sections.ordinal AS matched_ordinal,
+          delivery_sections.ordinal AS delivery_ordinal
+        FROM editor_knowledge_documents AS documents
+        INNER JOIN editor_knowledge_sections AS matched_sections
+          ON matched_sections.document_id = documents.document_id
+         AND matched_sections.section_revision_sha256 = documents.section_revision_sha256
+        INNER JOIN editor_knowledge_sections AS delivery_sections
+          ON delivery_sections.document_id = matched_sections.document_id
+         AND delivery_sections.section_id = matched_sections.delivery_section_id
+         AND delivery_sections.section_revision_sha256 = documents.section_revision_sha256
+        WHERE documents.section_revision_sha256 IS NOT NULL
+          AND matched_sections.is_searchable = TRUE
+          AND matched_sections.retrieval_text LIKE ? ESCAPE '\\\\'
+      ),
+      ranked_editor_matches AS (
+        SELECT
+          editor_span_matches.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY source_id, delivery_section_id
+            ORDER BY matched_span_position ASC, matched_ordinal ASC, matched_section_id ASC
+          ) AS delivery_match_rank
+        FROM editor_span_matches
+      ),
       document_matches AS (
         SELECT
           documents.document_id,
@@ -1282,7 +1770,7 @@ export function buildSearchSql(topK: number): string {
           documents.last_synced_at,
           0 AS delivery_ordinal
         FROM (${DOCUMENT_READ_MODEL_SQL}) AS documents
-        WHERE documents.source <> 'business_knowledge'
+        WHERE documents.section_count IS NULL
           AND documents.markdown LIKE ? ESCAPE '\\\\'
       )
       SELECT
@@ -1341,6 +1829,36 @@ export function buildSearchSql(topK: number): string {
           last_synced_at,
           delivery_ordinal
         FROM ranked_business_matches
+        WHERE delivery_match_rank = 1
+        UNION ALL
+        SELECT
+          document_id,
+          source,
+          source_id,
+          title,
+          markdown,
+          match_position,
+          matched_span_position,
+          matched_section_id,
+          matched_section_title,
+          matched_content_layer,
+          delivery_section_id,
+          delivery_section_title,
+          delivery_content_layer,
+          heading_path_json,
+          source_line_start,
+          source_line_end,
+          delivery_line_start,
+          delivery_line_end,
+          related_source_path,
+          freshness_class,
+          source_kind,
+          ingest_scope,
+          source_declared_at,
+          detail_available,
+          last_synced_at,
+          delivery_ordinal
+        FROM ranked_editor_matches
         WHERE delivery_match_rank = 1
       ) AS matches
       ORDER BY last_synced_at DESC, document_id ASC, delivery_ordinal ASC
@@ -1424,6 +1942,57 @@ export function buildKeywordSearchSql(termCount: number, topK: number): string {
           ) AS delivery_match_rank
         FROM business_span_matches
       ),
+      editor_span_matches AS (
+        SELECT
+          CONCAT('editor-knowledge:', documents.document_id) AS document_id,
+          'editor_knowledge' AS source,
+          documents.document_id AS source_id,
+          documents.title,
+          delivery_sections.section_markdown AS markdown,
+          1 AS match_position,
+          1 AS matched_span_position,
+          matched_sections.section_id AS matched_section_id,
+          matched_sections.title AS matched_section_title,
+          matched_sections.content_layer AS matched_content_layer,
+          delivery_sections.section_id AS delivery_section_id,
+          delivery_sections.title AS delivery_section_title,
+          delivery_sections.content_layer AS delivery_content_layer,
+          matched_sections.heading_path_json,
+          matched_sections.source_line_start,
+          matched_sections.source_line_end,
+          delivery_sections.source_line_start AS delivery_line_start,
+          delivery_sections.source_line_end AS delivery_line_end,
+          matched_sections.related_source_path,
+          matched_sections.freshness_class,
+          NULL AS source_kind,
+          NULL AS ingest_scope,
+          NULL AS source_declared_at,
+          NULL AS detail_available,
+          documents.last_synced_at,
+          matched_sections.ordinal AS matched_ordinal,
+          delivery_sections.ordinal AS delivery_ordinal,
+          ${businessScore} AS search_score
+        FROM editor_knowledge_documents AS documents
+        INNER JOIN editor_knowledge_sections AS matched_sections
+          ON matched_sections.document_id = documents.document_id
+         AND matched_sections.section_revision_sha256 = documents.section_revision_sha256
+        INNER JOIN editor_knowledge_sections AS delivery_sections
+          ON delivery_sections.document_id = matched_sections.document_id
+         AND delivery_sections.section_id = matched_sections.delivery_section_id
+         AND delivery_sections.section_revision_sha256 = documents.section_revision_sha256
+        WHERE documents.section_revision_sha256 IS NOT NULL
+          AND matched_sections.is_searchable = TRUE
+          AND (${businessWhere})
+      ),
+      ranked_editor_matches AS (
+        SELECT
+          editor_span_matches.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY source_id, delivery_section_id
+            ORDER BY search_score DESC, matched_ordinal ASC, matched_section_id ASC
+          ) AS delivery_match_rank
+        FROM editor_span_matches
+      ),
       document_matches AS (
         SELECT
           documents.document_id,
@@ -1454,7 +2023,7 @@ export function buildKeywordSearchSql(termCount: number, topK: number): string {
           0 AS delivery_ordinal,
           ${documentScore} AS search_score
         FROM (${DOCUMENT_READ_MODEL_SQL}) AS documents
-        WHERE documents.source <> 'business_knowledge'
+        WHERE documents.section_count IS NULL
           AND (${documentWhere})
       )
       SELECT
@@ -1516,6 +2085,37 @@ export function buildKeywordSearchSql(termCount: number, topK: number): string {
           search_score
         FROM ranked_business_matches
         WHERE delivery_match_rank = 1
+        UNION ALL
+        SELECT
+          document_id,
+          source,
+          source_id,
+          title,
+          markdown,
+          match_position,
+          matched_span_position,
+          matched_section_id,
+          matched_section_title,
+          matched_content_layer,
+          delivery_section_id,
+          delivery_section_title,
+          delivery_content_layer,
+          heading_path_json,
+          source_line_start,
+          source_line_end,
+          delivery_line_start,
+          delivery_line_end,
+          related_source_path,
+          freshness_class,
+          source_kind,
+          ingest_scope,
+          source_declared_at,
+          detail_available,
+          last_synced_at,
+          delivery_ordinal,
+          search_score
+        FROM ranked_editor_matches
+        WHERE delivery_match_rank = 1
       ) AS matches
       ORDER BY search_score DESC, last_synced_at DESC, document_id ASC, delivery_ordinal ASC
       LIMIT ${limitedTopK}`;
@@ -1527,16 +2127,18 @@ export function buildKeywordSearchParams(terms: string[]): string[] {
   }
   const patterns = terms.map(buildLikePattern);
   return [
-    ...patterns.flatMap((pattern) => [pattern, pattern]),
-    ...patterns.flatMap((pattern) => [pattern, pattern]),
-    ...patterns.flatMap((pattern) => [pattern, pattern]),
-    ...patterns.flatMap((pattern) => [pattern, pattern])
+    ...patterns.flatMap((pattern) => [pattern, pattern]), // business_span_matches search_score
+    ...patterns.flatMap((pattern) => [pattern, pattern]), // business_span_matches WHERE
+    ...patterns.flatMap((pattern) => [pattern, pattern]), // editor_span_matches search_score
+    ...patterns.flatMap((pattern) => [pattern, pattern]), // editor_span_matches WHERE
+    ...patterns.flatMap((pattern) => [pattern, pattern]), // document_matches search_score
+    ...patterns.flatMap((pattern) => [pattern, pattern])  // document_matches WHERE
   ];
 }
 
 function buildTermScoreSql(termCount: number, titleColumn: string, textColumn: string): string {
   return Array.from({ length: termCount }, () =>
-    `(CASE WHEN ${titleColumn} LIKE ? ESCAPE '\\\\' THEN 3 ELSE 0 END + ` +
+    `(CASE WHEN ${titleColumn} LIKE ? ESCAPE '\\\\' THEN 5 ELSE 0 END + ` +
     `CASE WHEN ${textColumn} LIKE ? ESCAPE '\\\\' THEN 1 ELSE 0 END)`
   ).join(" + ");
 }
@@ -1567,13 +2169,17 @@ function parseSearchContextHit(row: Record<string, unknown>): SearchContextHit {
     score: 0,
     search_stage: "phrase"
   };
-  if (source !== "business_knowledge") {
+  // document_matches rows (whole-document, non-sectioned fallback) always carry a NULL
+  // delivery_section_id; business_span_matches and editor_span_matches rows never do. This
+  // distinguishes a section hit from a plain document hit regardless of source, so both
+  // Business Knowledge and Editor Knowledge sectioned documents are enriched the same way.
+  if (row.delivery_section_id === null || row.delivery_section_id === undefined) {
     return hit;
   }
 
   const sourceId = parseRequiredString(row.source_id, "source_id");
   const deliverySectionId = parseRequiredString(row.delivery_section_id, "delivery_section_id");
-  return {
+  const sectionedHit: SearchContextHit = {
     ...hit,
     matched_span_position: parseNumber(row.matched_span_position, "matched_span_position"),
     matched_section_id: parseRequiredString(row.matched_section_id, "matched_section_id"),
@@ -1589,11 +2195,24 @@ function parseSearchContextHit(row: Record<string, unknown>): SearchContextHit {
     delivery_line_end: parseNumber(row.delivery_line_end, "delivery_line_end"),
     related_source_path: parseNullableString(row.related_source_path, "related_source_path"),
     freshness_class: parseNullableString(row.freshness_class, "freshness_class"),
+    resource_uri: source === "business_knowledge"
+      ? buildBusinessKnowledgeSectionUri(sourceId, deliverySectionId)
+      : buildEditorKnowledgeSectionUri(sourceId, deliverySectionId)
+  };
+
+  if (source !== "business_knowledge") {
+    // Editor Knowledge sectioned documents (planning-*) have no source_kind/ingest_scope/
+    // source_declared_at/detail_available concept; those columns don't exist on
+    // editor_knowledge_documents, so they are intentionally left unset here.
+    return sectionedHit;
+  }
+
+  return {
+    ...sectionedHit,
     source_kind: parseRequiredString(row.source_kind, "source_kind"),
     ingest_scope: parseRequiredString(row.ingest_scope, "ingest_scope"),
     source_declared_at: parseSourceDeclaredAt(row.source_declared_at),
-    detail_available: parseNullableBoolean(row.detail_available, "detail_available"),
-    resource_uri: buildBusinessKnowledgeSectionUri(sourceId, deliverySectionId)
+    detail_available: parseNullableBoolean(row.detail_available, "detail_available")
   };
 }
 
@@ -1678,6 +2297,42 @@ function parseListedBusinessKnowledgeResource(
   };
 }
 
+function parseEditorKnowledgeResource(row: Record<string, unknown>): EditorKnowledgeResource {
+  const documentId = parseRequiredString(row.document_id, "document_id");
+  const sectionId = parseRequiredString(row.section_id, "section_id");
+  return {
+    document_id: documentId,
+    section_id: sectionId,
+    title: parseRequiredString(row.title, "title"),
+    heading_path: parseStringArray(row.heading_path_json, "heading_path_json"),
+    content_layer: parseRequiredString(row.content_layer, "content_layer"),
+    markdown: parseRequiredString(row.section_markdown, "section_markdown"),
+    source_line_start: parseNumber(row.source_line_start, "source_line_start"),
+    source_line_end: parseNumber(row.source_line_end, "source_line_end"),
+    related_source_path: parseNullableString(row.related_source_path, "related_source_path"),
+    freshness_class: parseNullableString(row.freshness_class, "freshness_class"),
+    resource_uri: buildEditorKnowledgeSectionUri(documentId, sectionId)
+  };
+}
+
+function parseListedEditorKnowledgeResource(
+  row: Record<string, unknown>
+): ListedEditorKnowledgeResource {
+  const documentId = parseRequiredString(row.document_id, "document_id");
+  const sectionId = parseRequiredString(row.section_id, "section_id");
+  return {
+    document_id: documentId,
+    section_id: sectionId,
+    title: parseRequiredString(row.title, "title"),
+    heading_path: parseStringArray(row.heading_path_json, "heading_path_json"),
+    content_layer: parseRequiredString(row.content_layer, "content_layer"),
+    size_bytes: parseNumber(row.size_bytes, "size_bytes"),
+    related_source_path: parseNullableString(row.related_source_path, "related_source_path"),
+    freshness_class: parseNullableString(row.freshness_class, "freshness_class"),
+    resource_uri: buildEditorKnowledgeSectionUri(documentId, sectionId)
+  };
+}
+
 function parseAuthorStyleEvidenceHit(row: Record<string, unknown>): AuthorStyleEvidenceHit {
   const documentId = parseAuthorStyleDocumentId(row.document_id);
   const deliverySectionId = parseRequiredString(row.delivery_section_id, "delivery_section_id");
@@ -1728,9 +2383,7 @@ function parseListedAuthorStyleResource(
 
 function parseAuthorStyleDocumentId(value: unknown): AuthorStyleDocumentId {
   if (value === "example-title-style" || value === "example-body-style") return value;
-  throw new DataShapeError(
-    "document_id must be example-title-style or example-body-style"
-  );
+  throw new DataShapeError("document_id must be example-title-style or example-body-style");
 }
 
 function parseMetaskillEvidenceHit(row: Record<string, unknown>): MetaskillEvidenceHit {

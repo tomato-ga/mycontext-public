@@ -39,14 +39,15 @@ export async function runPullEditorKnowledge(flags: CliFlags): Promise<void> {
     await tidbClient?.close();
   }
 
-  const failedCount = countStatus(results, "failed");
+  const allStatuses = results.map((result) => result.status);
+  const failedCount = allStatuses.filter((status) => status === "failed").length;
   console.log(
     JSON.stringify(
       {
         status: failedCount > 0 ? "failed" : "ok",
         documents_total: results.length,
-        documents_synced: countStatus(results, "synced"),
-        documents_skipped: countStatus(results, "skipped"),
+        documents_synced: countStatus(allStatuses, "synced"),
+        documents_skipped: countStatus(allStatuses, "skipped"),
         documents_failed: failedCount
       },
       null,
@@ -74,8 +75,8 @@ function failedResult(documentId: EditorKnowledgeDocumentId, error: unknown): Ed
 }
 
 function countStatus(
-  results: EditorKnowledgeSyncResult[],
+  statuses: EditorKnowledgeSyncResult["status"][],
   status: EditorKnowledgeSyncResult["status"]
 ): number {
-  return results.filter((result) => result.status === status).length;
+  return statuses.filter((candidate) => candidate === status).length;
 }

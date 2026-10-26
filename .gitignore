@@ -14,14 +14,24 @@ dist/
 **/dist/
 .wrangler/
 **/.wrangler/
+.cloudflare/
+**/.cloudflare/
+__pycache__/
+*.pyc
 
 # Secrets and local runtime configuration.
 .env
 .env.*
 !.env.example
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
 *.local
 mirror.config.json
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Logs and local databases.
 logs/
@@ -30,3 +40,12 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+
+# Private exports, recovery data, and local task state.
+private-exports/
+exports/
+backups/
+*.dump
+*.sql.gz
+WORK_LOG.md
+.ai/

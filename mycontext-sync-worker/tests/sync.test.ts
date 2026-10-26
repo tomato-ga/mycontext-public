@@ -1,0 +1,1145 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { LoadedAuthorStyleDocument } from "../../mycontext-sync/src/authorStyle.js";
+import type { LoadedBusinessKnowledgeDocument } from "../../mycontext-sync/src/businessKnowledge.js";
+import { parseEditorKnowledgeSectionedMarkdown } from "../../mycontext-sync/src/editorKnowledge.js";
+import { sha256 } from "../src/hash.js";
+import {
+  canonicalAuthorStyleMarkdown,
+  canonicalEditorKnowledgeMarkdown,
+  processSyncMessage,
+  syncFingerprint
+} from "../src/sync.js";
+import type {
+  AuthorStyleState,
+  ManagedNotionDocument,
+  NotionGateway,
+  SyncMessage,
+  SyncRepository
+} from "../src/types.js";
+import { SyncFailure } from "../src/types.js";
+
+const pageId = "example-page";
+const now = new Date("2026-07-22T12:00:00.000Z");
+
+describe("Notion-managed context synchronization", () => {
+  let notion: NotionGateway;
+  let repository: SyncRepository;
+  let currentManaged: ManagedNotionDocument;
+
+  beforeEach(() => {
+    currentManaged = managedDocument();
+    notion = {
+      getManagedDocument: vi.fn().mockImplementation(async () => ({ ...currentManaged })),
+      getMarkdown: vi.fn().mockResolvedValue(markdown("# Profile\n\nBody")),
+      updateWorkflow: vi.fn().mockImplementation(async (_pageId, update) => {
+        currentManaged = {
+          ...currentManaged,
+          status: update.status,
+          syncedHash: update.syncedHash === undefined
+            ? currentManaged.syncedHash
+            : update.syncedHash,
+          activeRevision: update.activeRevision === undefined
+            ? currentManaged.activeRevision
+            : update.activeRevision
+        };
+      }),
+      findByDocumentId: vi.fn()
+    };
+    vi.mocked(notion.findByDocumentId).mockImplementation(async () => [{ ...currentManaged }]);
+    repository = {
+      appendSyncStateLog: vi.fn(),
+      syncNotionPage: vi.fn(),
+      getAuthorStyleState: vi.fn().mockResolvedValue(null),
+      activateAuthorStyle: vi.fn(),
+      getEditorKnowledgeSectionedState: vi.fn().mockResolvedValue(null),
+      activateEditorKnowledgeSectioned: vi.fn(),
+      getBusinessKnowledgeState: vi.fn().mockResolvedValue(null),
+      activateBusinessKnowledge: vi.fn()
+    };
+  });
+
+  it("syncs a Ready personal-context page and marks it Synced", async () => {
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      now: () => now
+    });
+
+    expect(result.status).toBe("synced");
+    expect(repository.syncNotionPage).toHaveBeenCalledWith(expect.objectContaining({
+      pageId,
+      originalPageId: null,
+      title: "Profile",
+      markdown: "# Profile\n\nBody"
+    }));
+    expect(notion.updateWorkflow).toHaveBeenNthCalledWith(1, pageId, {
+      status: "Syncing",
+      tidbTables: ["notion_pages"],
+      validationError: null
+    });
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Synced",
+      tidbTables: ["notion_pages"],
+      syncedHash: syncFingerprint(managedDocument(), "# Profile\n\nBody"),
+      lastSyncedAt: now.toISOString()
+    }));
+    expect(vi.mocked(repository.appendSyncStateLog).mock.calls.map(([entry]) => entry.state))
+      .toEqual([
+        "received",
+        "eligible",
+        "syncing",
+        "source_verified",
+        "content_validated",
+        "persisted",
+        "synced"
+      ]);
+  });
+
+  it("syncs a Ready AI Skill through the generic Notion read model", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-analysis-skill",
+      name: "example-analysis-skill: Sample analysis",
+      category: "AI Skill",
+      schemaVersion: "ai-skill-v1"
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      now: () => now
+    });
+
+    expect(result.status).toBe("synced");
+    expect(repository.syncNotionPage).toHaveBeenCalledWith(expect.objectContaining({
+      pageId,
+      title: "example-analysis-skill: Sample analysis"
+    }));
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      tidbTables: ["notion_pages"]
+    }));
+  });
+
+  it("syncs Business Knowledge through its semantic document and section tables", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-business-guide",
+      name: "Example business guide",
+      category: "Business Knowledge",
+      schemaVersion: "business-knowledge-v1"
+    });
+    const document = businessKnowledgeDocument();
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      parseBusinessKnowledge: () => document,
+      now: () => now
+    });
+
+    expect(result).toMatchObject({
+      status: "synced",
+      documentId: "example-business-guide",
+      revisionSha256: document.sectionRevisionSha256
+    });
+    expect(repository.activateBusinessKnowledge).toHaveBeenCalledWith({ document });
+    expect(notion.updateWorkflow).toHaveBeenNthCalledWith(1, pageId, {
+      status: "Syncing",
+      tidbTables: ["business_knowledge_documents", "business_knowledge_sections"],
+      validationError: null
+    });
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Synced",
+      tidbTables: ["business_knowledge_documents", "business_knowledge_sections"]
+    }));
+  });
+
+  it("uses the public guide parser at the Notion-to-TiDB boundary", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-business-guide",
+      name: "Example business guide",
+      category: "Business Knowledge",
+      schemaVersion: "business-knowledge-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown("## Plan\nChoose one question.\n\n### Check\nRecord the result.\n"));
+
+    const result = await processSyncMessage(message("page.properties_updated"), { notion, repository });
+
+    expect(result.status).toBe("synced");
+    const saved = vi.mocked(repository.activateBusinessKnowledge).mock.calls[0][0].document;
+    expect(saved.documentId).toBe("example-business-guide");
+    expect(saved.sections[0].sectionMarkdown).toContain("### Check\nRecord the result.");
+    expect(saved.sections[1].deliverySectionId).toBe(saved.sections[0].sectionId);
+  });
+
+  it("keeps the saved guide when semantic validation fails", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-business-guide",
+      name: "Example business guide",
+      category: "Business Knowledge",
+      schemaVersion: "business-knowledge-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown("### Orphaned rule\nNo parent section.\n"));
+
+    const result = await processSyncMessage(message("page.properties_updated"), { notion, repository });
+
+    expect(result).toMatchObject({ status: "failed", reason: "business_knowledge_validation_failed" });
+    expect(repository.activateBusinessKnowledge).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({ status: "Error" }));
+  });
+
+  it("keeps a Metaskill snapshot read-only when someone sets it Ready", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-metaskill",
+      name: "Example metaskill guide",
+      category: "Metaskill",
+      schemaVersion: "metaskill-v1",
+      syncSource: "TiDB"
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "metaskill_snapshot_read_only" });
+    expect(repository.syncNotionPage).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Conflict",
+      tidbTables: [
+        "metaskill_documents",
+        "metaskill_revisions",
+        "metaskill_sections"
+      ]
+    }));
+  });
+
+  it("surfaces an invalid Notion management schema on the page", async () => {
+    vi.mocked(notion.getManagedDocument).mockRejectedValue(new SyncFailure(
+      "notion_property_missing",
+      "Document ID must not be empty"
+    ));
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toEqual({ pageId, status: "failed", reason: "notion_property_missing" });
+    expect(notion.updateWorkflow).toHaveBeenCalledWith(pageId, expect.objectContaining({
+      status: "Error",
+      validationError: expect.stringContaining("Document ID")
+    }));
+  });
+
+  it("ignores pages outside the configured data source without modifying them", async () => {
+    vi.mocked(notion.getManagedDocument).mockRejectedValue(new SyncFailure(
+      "notion_data_source_mismatch",
+      "outside data source",
+      { workflowStatus: "Conflict" }
+    ));
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toEqual({ pageId, status: "ignored", reason: "notion_data_source_mismatch" });
+    expect(notion.updateWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("ignores a self-generated property event when the Notion fingerprint is unchanged", async () => {
+    currentManaged = managedDocument({
+      status: "Synced",
+      syncedHash: syncFingerprint(managedDocument(), "# Profile\n\nBody")
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result.status).toBe("ignored");
+    expect(repository.syncNotionPage).not.toHaveBeenCalled();
+  });
+
+  it("reports Conflict when Document ID is duplicated", async () => {
+    vi.mocked(notion.findByDocumentId).mockResolvedValue([
+      managedDocument(),
+      managedDocument({ pageId: "duplicate-page" })
+    ]);
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "notion_document_id_duplicate" });
+    expect(repository.syncNotionPage).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Conflict"
+    }));
+  });
+
+  it("resumes an idempotent retry from Syncing", async () => {
+    currentManaged = managedDocument({ status: "Syncing" });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result.status).toBe("synced");
+    expect(notion.updateWorkflow).not.toHaveBeenCalledWith(pageId, expect.objectContaining({
+      status: "Syncing"
+    }));
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Synced"
+    }));
+  });
+
+  it("activates a Notion revision when adopting an existing local author style", async () => {
+    const sourceMarkdown = "# Style";
+    const document = authorStyleDocument(sourceMarkdown, "new-revision");
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style",
+      category: "Author Style",
+      schemaVersion: "author-style-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(sourceMarkdown));
+    vi.mocked(repository.getAuthorStyleState).mockResolvedValue({
+      contextSha256: "existing-revision",
+      sourceMarkdownSha256: sha256("# Existing local style"),
+      sourcePathKey: "knowledge/example-body-style-analysis.md"
+    } satisfies AuthorStyleState);
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      parseAuthorStyle: () => document
+    });
+
+    expect(result).toMatchObject({ status: "synced", revisionSha256: "new-revision" });
+    expect(repository.activateAuthorStyle).toHaveBeenCalledWith({
+      document,
+      notionPageId: pageId,
+      expectedState: expect.objectContaining({ sourcePathKey: "knowledge/example-body-style-analysis.md" })
+    });
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Synced",
+      tidbTables: ["author_style_documents", "author_style_current_sections"],
+      activeRevision: null
+    }));
+  });
+
+  it("rejects an Author Style page outside the configured two-page allowlist", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style",
+      category: "Author Style",
+      schemaVersion: "author-style-v1"
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      authorStylePageIds: {
+        "example-title-style": "title-page",
+        "example-body-style": "different-body-page"
+      }
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      reason: "author_style_page_not_allowed"
+    });
+    expect(notion.getMarkdown).not.toHaveBeenCalled();
+    expect(repository.activateAuthorStyle).not.toHaveBeenCalled();
+  });
+
+  it("reports Conflict when another Notion page already owns an author style", async () => {
+    const document = authorStyleDocument("# Notion style", "notion-revision");
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style",
+      category: "Author Style",
+      schemaVersion: "author-style-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(document.sourceMarkdown));
+    vi.mocked(repository.getAuthorStyleState).mockResolvedValue({
+      contextSha256: "existing-revision",
+      sourceMarkdownSha256: sha256("# Existing style"),
+      sourcePathKey: "notion:another-page"
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      parseAuthorStyle: () => document
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "author_style_owned_by_another_notion_page" });
+    expect(repository.activateAuthorStyle).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Conflict"
+    }));
+  });
+
+  it("moves author-style ownership only when Original Page ID declares the current owner", async () => {
+    const previousPageId = "example-data-source";
+    const document = authorStyleDocument("# Notion style v2", "notion-revision-v2");
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style v2",
+      category: "Author Style",
+      schemaVersion: "author-style-v1",
+      originalPageId: previousPageId
+    });
+    vi.mocked(notion.findByDocumentId).mockResolvedValue([
+      { ...currentManaged },
+      managedDocument({
+        pageId: previousPageId,
+        documentId: "example-body-style",
+        name: "Body style",
+        category: "Author Style",
+        schemaVersion: "author-style-v1",
+        status: "Synced"
+      })
+    ]);
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(document.sourceMarkdown));
+    const state: AuthorStyleState = {
+      contextSha256: "existing-revision",
+      sourceMarkdownSha256: sha256("# Existing style"),
+      sourcePathKey: `notion:${previousPageId}`
+    };
+    vi.mocked(repository.getAuthorStyleState).mockResolvedValue(state);
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      parseAuthorStyle: () => document
+    });
+
+    expect(result).toMatchObject({ status: "synced", revisionSha256: "notion-revision-v2" });
+    expect(repository.activateAuthorStyle).toHaveBeenCalledWith({
+      document,
+      notionPageId: pageId,
+      expectedState: state
+    });
+  });
+
+  it("activates a changed author style after Notion already owns it", async () => {
+    const document = authorStyleDocument("# Updated style", "updated-revision");
+    const state: AuthorStyleState = {
+      contextSha256: "old-revision",
+      sourceMarkdownSha256: sha256("# Old style"),
+      sourcePathKey: `notion:${pageId}`
+    };
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style",
+      category: "Author Style",
+      schemaVersion: "author-style-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(document.sourceMarkdown));
+    vi.mocked(repository.getAuthorStyleState).mockResolvedValue(state);
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      parseAuthorStyle: () => document
+    });
+
+    expect(result).toMatchObject({ status: "synced", revisionSha256: "updated-revision" });
+    expect(repository.activateAuthorStyle).toHaveBeenCalledWith({
+      document,
+      notionPageId: pageId,
+      expectedState: state
+    });
+  });
+
+  it("does not write if Notion content changes during synchronization", async () => {
+    vi.mocked(notion.getMarkdown)
+      .mockResolvedValueOnce(markdown("# First"))
+      .mockResolvedValueOnce(markdown("# Second"));
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "notion_content_changed_during_sync" });
+    expect(repository.syncNotionPage).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Conflict"
+    }));
+  });
+
+  it("ignores rotating signatures on the same Notion-hosted image", async () => {
+    const first = [
+      "# Profile",
+      "",
+      "![Desk](https://prod-files-secure.s3.us-west-2.amazonaws.com/workspace/file/desk.jpg?X-Amz-Date=20260726T010000Z&X-Amz-Signature=first)"
+    ].join("\n");
+    const second = [
+      "# Profile",
+      "",
+      "![Desk](https://prod-files-secure.s3.us-west-2.amazonaws.com/workspace/file/desk.jpg?X-Amz-Date=20260726T010001Z&X-Amz-Signature=second)"
+    ].join("\n");
+    vi.mocked(notion.getMarkdown)
+      .mockResolvedValueOnce(markdown(first))
+      .mockResolvedValueOnce(markdown(second));
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toMatchObject({ status: "synced" });
+    expect(syncFingerprint(managedDocument(), first))
+      .toBe(syncFingerprint(managedDocument(), second));
+    expect(repository.syncNotionPage).toHaveBeenCalledWith(expect.objectContaining({
+      markdown: second
+    }));
+  });
+
+  it("still detects a different Notion-hosted image object", () => {
+    const first = "![Desk](https://prod-files-secure.s3.us-west-2.amazonaws.com/workspace/file/desk.jpg?X-Amz-Signature=first)";
+    const second = "![Desk](https://prod-files-secure.s3.us-west-2.amazonaws.com/workspace/file/other.jpg?X-Amz-Signature=second)";
+
+    expect(syncFingerprint(managedDocument(), first))
+      .not.toBe(syncFingerprint(managedDocument(), second));
+  });
+
+  it("keeps the active revision when Notion Markdown is incomplete", async () => {
+    vi.mocked(notion.getMarkdown).mockResolvedValue({
+      markdown: "# Partial",
+      truncated: true,
+      unknownBlockIds: ["block-1"]
+    });
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "notion_markdown_incomplete" });
+    expect(repository.syncNotionPage).not.toHaveBeenCalled();
+    expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+      status: "Error"
+    }));
+  });
+
+  it("keeps reproducible evidence when the current body outline is invalid", async () => {
+    currentManaged = managedDocument({
+      documentId: "example-body-style",
+      name: "Body style",
+      category: "Author Style",
+      schemaVersion: "author-style-v1"
+    });
+    vi.mocked(notion.getMarkdown).mockResolvedValue(markdown("## 21. Longform\n\n### 21.9 Contract\n\nBody\n\n## 22. References"));
+
+    const result = await processSyncMessage(message("page.properties_updated"), {
+      notion,
+      repository,
+      now: () => now,
+      parseAuthorStyle: () => {
+        throw new SyncFailure(
+          "author_style_validation_failed",
+          "example-body-style H2 outline changed"
+        );
+      }
+    });
+
+    expect(result).toMatchObject({ status: "failed", reason: "author_style_validation_failed" });
+    const entries = vi.mocked(repository.appendSyncStateLog).mock.calls.map(([entry]) => entry);
+    expect(entries.at(-1)).toMatchObject({
+      state: "failed",
+      documentId: "example-body-style",
+      validationStatus: "failed",
+      parserVersion: "author-style-parser-v4",
+      errorCode: "author_style_validation_failed",
+      errorMessage: "example-body-style H2 outline changed",
+      retryable: false,
+      nextAction: "review_notion_and_set_ready"
+    });
+    expect(entries.at(-1)?.sourceMarkdownSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(entries.at(-1)?.inputFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(entries.some((entry) => entry.state === "content_validated")).toBe(false);
+  });
+
+  it("restores an H1 from the Notion page title for author-style parsing", () => {
+    expect(canonicalAuthorStyleMarkdown(
+      managedDocument({ name: "山田太郎 タイトル再現ガイド" }),
+      "## 使い方\n\n本文"
+    )).toBe("# 山田太郎 タイトル再現ガイド\n\n## 使い方\n\n本文");
+    expect(canonicalAuthorStyleMarkdown(
+      managedDocument({ name: "Ignored" }),
+      "# Existing title\n\nBody"
+    )).toBe("# Existing title\n\nBody");
+  });
+
+  it("keeps a real H1 after a blank line while ignoring H1-shaped code", () => {
+    const markdown = [
+      "導入",
+      "",
+      "# Existing title",
+      "",
+      "```markdown",
+      "# This is code, not a title",
+      "```",
+      "",
+      "本文"
+    ].join("\n");
+
+    expect(canonicalAuthorStyleMarkdown(managedDocument({ name: "Ignored" }), markdown))
+      .toBe(markdown);
+    expect(canonicalEditorKnowledgeMarkdown(managedDocument({ name: "Ignored" }), markdown))
+      .toBe(markdown);
+  });
+
+  it("does not close a long fence with a short marker, another fence character, or trailing text", () => {
+    const markdown = [
+      "````markdown",
+      "# This is code, not a title",
+      "```",
+      "# This is still code",
+      "~~~~",
+      "# This is also still code",
+      "```` not a closing fence",
+      "# This is still code too",
+      "````   ",
+      "## Body"
+    ].join("\n");
+    const expected = `# Page title\n\n${markdown}`;
+
+    expect(canonicalAuthorStyleMarkdown(managedDocument({ name: "Page title" }), markdown))
+      .toBe(expected);
+    expect(canonicalEditorKnowledgeMarkdown(managedDocument({ name: "Page title" }), markdown))
+      .toBe(expected);
+  });
+
+  describe("Editor Knowledge (planning) synchronization", () => {
+    it("restores the H1 from the Notion page Name when the page body has none, like Author Style", async () => {
+      // Notion page bodies hold only the content blocks; the title lives in the Name
+      // property, never as an H1 block in the body. This mirrors
+      // canonicalAuthorStyleMarkdown's normalization exactly.
+      const bodyWithoutH1 = [
+        "## 1. 企画の立て方",
+        "第1章の本文。",
+        "",
+        "## 2. 構成の作り方",
+        "第2章の本文。",
+        ""
+      ].join("\n");
+      currentManaged = managedDocument({
+        documentId: "planning-playbook",
+        name: "企画構成プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(bodyWithoutH1));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document.title).toBe("企画構成プレイブック");
+      expect(activated?.document.markdown.startsWith("# 企画構成プレイブック\n\n## 1. 企画の立て方")).toBe(true);
+    });
+
+    it("restores the H1 when a fenced code example contains an H1-shaped line", async () => {
+      const bodyWithoutH1 = [
+        "## 1. 企画の立て方",
+        "第1章の本文。",
+        "",
+        "```markdown",
+        "# This is code, not the page title",
+        "```",
+        "",
+        "## 2. 構成の作り方",
+        "第2章の本文。",
+        ""
+      ].join("\n");
+      currentManaged = managedDocument({
+        documentId: "planning-playbook",
+        name: "企画構成プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(bodyWithoutH1));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document.markdown.startsWith("# 企画構成プレイブック\n\n## 1. 企画の立て方")).toBe(true);
+    });
+
+    it("restores the H1 for planning-catalog from its Name too", async () => {
+      const bodyWithoutH1 = [
+        "## テーマ群A｜サンプル企画",
+        "グループAの概要文。",
+        "",
+        "### No.1 ｜ 最初の企画",
+        "企画1の本文。",
+        ""
+      ].join("\n");
+      currentManaged = managedDocument({
+        documentId: "planning-catalog",
+        name: "コンテンツ企画案カタログ（全424件）",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(bodyWithoutH1));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document.title).toBe("コンテンツ企画案カタログ（全424件）");
+    });
+
+    it("syncs a Ready planning-playbook page and marks it Synced", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-playbook",
+        name: "企画構成プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_PLAYBOOK_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced", documentId: "planning-playbook" });
+      expect(repository.activateEditorKnowledgeSectioned).toHaveBeenCalledOnce();
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document).toMatchObject({
+        documentId: "planning-playbook",
+        sectionCount: 2,
+        searchSpanCount: 2
+      });
+      expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+        status: "Synced"
+      }));
+      const entries = vi.mocked(repository.appendSyncStateLog).mock.calls.map(([entry]) => entry);
+      expect(entries.at(-1)).toMatchObject({
+        state: "synced",
+        parserVersion: "section-parser-v1",
+        sectioningVersion: "section-first-v1",
+        routingVersion: null
+      });
+    });
+
+    it("syncs a Ready media-design-playbook page as one whole-document record", async () => {
+      currentManaged = managedDocument({
+        documentId: "media-design-playbook",
+        name: "メディア設計・運営プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_PLAYBOOK_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced", documentId: "media-design-playbook" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document).toMatchObject({
+        documentId: "media-design-playbook",
+        storageMode: "whole_document",
+        sectionCount: 0,
+        searchSpanCount: 0,
+        sections: []
+      });
+      expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+        status: "Synced",
+        tidbTables: ["editor_knowledge_documents"]
+      }));
+    });
+
+    it.each([
+      ["editing-playbook", "編集プレイブック"],
+      ["editing-playbook-v2", "編集プレイブック v2"],
+      ["proofreading-playbook", "校正プレイブック"]
+    ])("syncs %s through the same whole-document path", async (documentId, name) => {
+      currentManaged = managedDocument({
+        documentId,
+        name,
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_PLAYBOOK_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced", documentId });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document).toMatchObject({
+        documentId,
+        storageMode: "whole_document",
+        sectionCount: 0,
+        searchSpanCount: 0,
+        sections: []
+      });
+      expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+        status: "Synced",
+        tidbTables: ["editor_knowledge_documents"]
+      }));
+    });
+
+    it("syncs a Ready planning-catalog page, preserving No.N ｜ Title and group headings", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-catalog",
+        name: "企画カタログ427",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_CATALOG_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced", documentId: "planning-catalog" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document.sections.map((section) => section.sectionId)).toEqual([
+        "group-a",
+        "no-001",
+        "no-002"
+      ]);
+      const entry = activated?.document.sections.find((section) => section.sectionId === "no-001");
+      // the exact Markdown text Notion is expected to hand back for an entry heading — this
+      // is the round-trip fidelity the format contract depends on: the full-width pipe "｜",
+      // the "### No.N" prefix, and no flattening to a different heading level survive intact
+      expect(entry?.retrievalText).toBe("### No.1 ｜ 最初の企画\n企画1の本文。");
+      expect(entry?.title).toBe("No.1 ｜ 最初の企画");
+    });
+
+    it("skips re-activation when the section revision is unchanged", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-playbook",
+        name: "企画構成プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_PLAYBOOK_MARKDOWN));
+      const parsed = parseEditorKnowledgeSectionedMarkdown({
+        documentId: "planning-playbook",
+        markdown: PLANNING_PLAYBOOK_MARKDOWN,
+        sourcePathKey: `notion:${pageId}`
+      });
+      vi.mocked(repository.getEditorKnowledgeSectionedState).mockResolvedValue({
+        activeSectionRevisionSha256: parsed.sectionRevisionSha256
+      });
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "skipped" });
+      expect(repository.activateEditorKnowledgeSectioned).not.toHaveBeenCalled();
+    });
+
+    it("fails with a validation error and sets Notion to Error when the format contract is violated", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-playbook",
+        name: "企画構成プレイブック",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      // no ## chapter headings at all — violates the format contract
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown("# 企画構成プレイブック\n\n本文のみ。\n"));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository
+      });
+
+      expect(result).toMatchObject({ status: "failed", reason: "editor_knowledge_validation_failed" });
+      expect(repository.activateEditorKnowledgeSectioned).not.toHaveBeenCalled();
+      expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+        status: "Error",
+        validationError: expect.stringContaining("editor_knowledge_validation_failed")
+      }));
+    });
+
+    it("fails with Error when the Document ID is not a known planning document", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-unknown-doc",
+        name: "不明な企画文書",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_PLAYBOOK_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository
+      });
+
+      expect(result).toMatchObject({ status: "failed", reason: "editor_knowledge_document_id_invalid" });
+      expect(repository.activateEditorKnowledgeSectioned).not.toHaveBeenCalled();
+      expect(notion.updateWorkflow).toHaveBeenLastCalledWith(pageId, expect.objectContaining({
+        status: "Error"
+      }));
+    });
+
+    it("does not touch Editor Knowledge repository methods when syncing other categories", async () => {
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result.status).toBe("synced");
+      expect(repository.getEditorKnowledgeSectionedState).not.toHaveBeenCalled();
+      expect(repository.activateEditorKnowledgeSectioned).not.toHaveBeenCalled();
+    });
+
+    it("routes a planning-fulltext-* Document ID to the fulltext parser, keeping other headings as body text", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-fulltext-3",
+        name: "企画ノウハウ全文集 3（No.97〜No.144）",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown(PLANNING_FULLTEXT_MARKDOWN));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository,
+        now: () => now
+      });
+
+      expect(result).toMatchObject({ status: "synced", documentId: "planning-fulltext-3" });
+      const activated = vi.mocked(repository.activateEditorKnowledgeSectioned).mock.calls[0]?.[0];
+      expect(activated?.document.sections.map((section) => section.sectionId)).toEqual([
+        "preamble",
+        "no-097",
+        "no-098",
+        "x-01"
+      ]);
+      const entry = activated?.document.sections.find((section) => section.sectionId === "no-097");
+      expect(entry?.sectionMarkdown).toContain("### 根拠ノート全文（マスキング済み）");
+      expect(entry?.sectionMarkdown).toContain("## No.9 ｜ dummy"); // fenced, not a real boundary
+    });
+
+    it("fails when a planning-fulltext-* page violates the entry heading contract via a duplicate No.", async () => {
+      currentManaged = managedDocument({
+        documentId: "planning-fulltext-9",
+        name: "企画ノウハウ全文集 9",
+        category: "Editor Knowledge",
+        schemaVersion: "editor-knowledge-v1"
+      });
+      vi.mocked(notion.getMarkdown).mockResolvedValue(markdown([
+        "## No.1 ｜ 一つ目",
+        "本文",
+        "",
+        "## No.1 ｜ 重複",
+        "本文",
+        ""
+      ].join("\n")));
+
+      const result = await processSyncMessage(message("page.properties_updated"), {
+        notion,
+        repository
+      });
+
+      expect(result).toMatchObject({ status: "failed", reason: "editor_knowledge_validation_failed" });
+      expect(repository.activateEditorKnowledgeSectioned).not.toHaveBeenCalled();
+    });
+  });
+
+});
+
+function managedDocument(
+  overrides: Partial<ManagedNotionDocument> = {}
+): ManagedNotionDocument {
+  return {
+    pageId,
+    dataSourceId: "data-source",
+    documentId: "profile",
+    name: "Profile",
+    category: "Personal Context",
+    status: "Ready",
+    active: true,
+    schemaVersion: "personal-context-v1",
+    syncSource: "Notion",
+    originalPageId: null,
+    syncedHash: null,
+    activeRevision: null,
+    lastEditedTime: "2026-07-22T11:59:00.000Z",
+    ...overrides
+  } as ManagedNotionDocument;
+}
+
+function markdown(value: string) {
+  return { markdown: value, truncated: false, unknownBlockIds: [] };
+}
+
+function message(eventType: SyncMessage["eventType"] = "page.properties_updated"): SyncMessage {
+  return { eventId: "event-1", eventType, pageId, timestamp: now.toISOString() };
+}
+
+function authorStyleDocument(
+  sourceMarkdown: string,
+  revisionSha256: string
+): LoadedAuthorStyleDocument {
+  return {
+    documentId: "example-body-style",
+    authorKey: "example-author",
+    styleScope: "body",
+    displayName: "Body style",
+    sourcePathKey: `notion:${pageId}`,
+    sourceMarkdown,
+    sourceMarkdownSha256: sha256(sourceMarkdown),
+    sourceBytes: new TextEncoder().encode(sourceMarkdown).byteLength,
+    sourceLineCount: 1,
+    sourceMtimeMs: 1,
+    revisionSha256,
+    parserVersion: "parser-v1",
+    sectioningVersion: "sectioning-v1",
+    routingVersion: "routing-v1",
+    routingManifest: {},
+    outline: {},
+    sectionCount: 0,
+    deliverySectionCount: 0,
+    searchSpanCount: 0,
+    sections: []
+  };
+}
+
+function businessKnowledgeDocument(): LoadedBusinessKnowledgeDocument {
+  const markdownValue = "# Example business guide\n\n本文\n";
+  const revision = sha256("business-revision");
+  return {
+    documentId: "example-business-guide",
+    title: "Example business guide",
+    sourcePathKey: `notion:${pageId}`,
+    sourceKind: "book_transcription",
+    ingestScope: "full_text",
+    sourceDeclaredAt: "2026-01-01",
+    sourceBytes: new TextEncoder().encode(markdownValue).byteLength,
+    sourceLineCount: 3,
+    sourceMtimeMs: 1,
+    markdown: markdownValue,
+    markdownSha256: sha256(markdownValue),
+    sectionRevisionSha256: revision,
+    parserVersion: "book-transcription-parser-v1",
+    sectioningVersion: "toc-anchor-sectioning-v1",
+    sectionCount: 1,
+    searchSpanCount: 1,
+    outline: {},
+    routingMetadata: {},
+    sections: [{
+      documentId: "example-business-guide",
+      sectionId: "chapter-01",
+      sectionRevisionSha256: revision,
+      parentSectionId: null,
+      deliverySectionId: "chapter-01",
+      sectionType: "numbered_section",
+      headingLevel: 2,
+      sectionNumber: "1",
+      title: "第1章",
+      headingPath: ["Example business guide", "第1章"],
+      contentLayer: "detail",
+      ordinal: 1,
+      sourceLineStart: 1,
+      sourceLineEnd: 3,
+      directMarkdown: markdownValue,
+      sectionMarkdown: markdownValue,
+      retrievalText: markdownValue,
+      contentSha256: sha256(markdownValue),
+      isSearchable: true,
+      relatedSourcePath: null,
+      freshnessClass: "static_framework"
+    }]
+  };
+}
+
+// Representative of what the Notion "page markdown" API is expected to hand back for a planning
+// page's blocks: heading text (including the format contract's literal "## N." prefix and the
+// full-width "｜" delimiter) preserved verbatim as plain heading text, not reinterpreted into
+// something else (e.g. an ordered list). These fixtures stand in for that external conversion
+// boundary — see notion.ts's getMarkdown, which calls Notion's own /markdown endpoint.
+const PLANNING_PLAYBOOK_MARKDOWN = [
+  "# 企画構成プレイブック",
+  "",
+  "## 1. 企画の立て方",
+  "第1章の本文。",
+  "",
+  "## 2. 構成の作り方",
+  "第2章の本文。",
+  ""
+].join("\n");
+
+const PLANNING_CATALOG_MARKDOWN = [
+  "# Example planning catalog",
+  "",
+  "## テーマ群A｜サンプル企画",
+  "グループAの概要文。",
+  "",
+  "### No.1 ｜ 最初の企画",
+  "企画1の本文。",
+  "",
+  "### No.2 ｜ 二つ目の企画",
+  "企画2の本文。",
+  ""
+].join("\n");
+
+// planning-fulltext-* has no group/sequence contract: entry boundaries are only H2 lines matching
+// "No.N ｜ Title" / "No.なし-N ｜ Title" exactly, and everything else (other heading levels,
+// fenced code) survives verbatim as body text.
+const PLANNING_FULLTEXT_MARKDOWN = [
+  "# Example planning examples",
+  "",
+  "以下は構造の検証だけに使用する合成サンプルです。",
+  "",
+  "## No.97 ｜ 最初の企画",
+  "- **索引**: editor-knowledge:planning-catalog#no-097",
+  "",
+  "### 根拠ノート全文（マスキング済み）",
+  "",
+  "本文1。コードフェンス内のダミー見出しはエントリ境界にならない:",
+  "```",
+  "## No.9 ｜ dummy",
+  "```",
+  "",
+  "## No.98 ｜ 二つ目の企画",
+  "- **索引**: editor-knowledge:planning-catalog#no-098",
+  "",
+  "### 根拠ノート全文（マスキング済み）",
+  "",
+  "本文2。",
+  "",
+  "## No.なし-1 ｜ 番号なしの企画",
+  "根拠ノート本文はDB上に存在しない（本文取得状態: 未特定）。索引の要旨を参照。",
+  ""
+].join("\n");

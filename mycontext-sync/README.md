@@ -1,222 +1,122 @@
 # mycontext-sync
 
-Notion profile pages, fixed editor knowledge, and fixed business knowledge
-Markdown to TiDB sync CLI.
+Notion とローカル Markdown を TiDB へ保存し、同期結果を検証する TypeScript CLI です。
+埋め込みや文字数による分割は行いません。見出しや意味のまとまりを保存し、MCP Worker が用途に応じて必要な本文を読み取ります。
 
-The stored shape is intentionally small: one Notion page becomes one row in
-`notion_pages`, and the page body is saved as full Markdown text. There are no
-embeddings, chunks, roles, tags, slugs, or local MCP server.
-The fixed editor knowledge corpus is stored separately in
-`editor_knowledge_documents`.
-The fixed two-document business corpus is stored in
-`business_knowledge_documents` plus versioned `business_knowledge_sections`.
-Its boundaries come from H2/H3 headings or numbered `§` entries, never a
-character-count splitter.
-The two fixed author-style documents use three dedicated revisioned tables.
-They are stored as semantic delivery/search units; runtime selection happens
-server-side so an AI receives one complete context pack per request.
-The fixed Metaskill transcription follows the same append-only three-table
-pattern, with topic/intent/depth routing over complete semantic sections.
+## Author Style の現行構成
 
-## Scope
+文体ガイドの正本は Notion です。[同期 Worker](../mycontext-sync-worker/README.md) が `Ready` のページを受け取り、検証した内容を次の2テーブルへ反映します。
 
-Implemented:
+- `author_style_documents`: 原文、SHA-256、用途とセクションの対応表、件数を持つ現在の文書。
+- `author_style_current_sections`: 配信する意味単位と、その単位を探すための検索用セクション。
 
-- Fixed Notion page list sync to TiDB.
-- Automatic discovery of child pages and page links below the configured seed
-  pages.
-- `migrate`, `pull`, `doctor`, and `search` commands.
-- Fixed 8-document editor knowledge sync via `pull-editor-knowledge` and
-  verification via `doctor-editor-knowledge`.
-- Fixed 2-document, section-first business knowledge sync via the dedicated
-  `migrate-business-knowledge`, `pull-business-knowledge`, and
-  `doctor-business-knowledge` commands.
-- Fixed title/body author-style sync via `migrate-author-style`,
-  `pull-author-style`, and `doctor-author-style`.
-- Fixed Metaskill transcription sync via `migrate-metaskill`,
-  `pull-metaskill`, and `doctor-metaskill`.
-- Plain `LIKE` search over `notion_pages.markdown`.
+同期 Worker は各処理を `context_sync_state_log` に記録します。Author Style だけを使う場合も、
+`pnpm migrate-author-style` と `pnpm migrate-sync-state-log` の両方を先に実行してください。
+一般検索や resource 一覧まで使う場合は、[全体のセットアップ](../README.md)に従って他のナレッジ用スキーマも作成します。
 
-Not implemented, by design:
+CLI はテーブル作成、保存内容の再検証、バックアップ、緊急復元を担当します。
+旧版の `pull-author-style` と `AUTHOR_STYLE_SOURCE_ROOT` は廃止しました。
+タイトルと本文の document ID は `example-title-style` / `example-body-style`、著者キーは `example-author` です。
 
-- Worker-side or realtime Obsidian sync.
-- Chunk tables or vector embeddings.
-- Character-count section splitting or overlap windows.
-- Role, tag, slug, or profile-category storage.
-- Whole-workspace Notion sync / Data Source Query.
-- Webhooks.
+parser は例示ガイドのアウトラインを検証し、文字数で機械的には切りません。
+タイトルには固定の `context-key` を付け、本文は見出しから固定キーを割り当てます。
+長文用のルールも用途に含め、取得結果が45,000字を超える場合は切り捨てずエラーにします。
 
-## Setup
+## セットアップ
 
-1. Create a Notion integration, give it read content permission, and share each
-   target Notion page with it.
-2. Copy `.env.example` to `.env` and fill in `NOTION_API_KEY` / TiDB connection
-   values. `.env` is gitignored.
-3. Put the seed `pages[]` entries (`pageId` + `title`) in `MIRROR_CONFIG_JSON`
-   inside `.env`. If you prefer a separate local file, copy
-   `mirror.config.example.json` to `mirror.config.json`; that file is also
-   gitignored. `MIRROR_CONFIG_JSON` takes precedence when present.
-4. `pull` will also recurse through `child_page` blocks and `link_to_page`
-   blocks below those seed pages.
-5. Set `EDITOR_KNOWLEDGE_SOURCE_ROOT` in `.env` to the absolute path of your
-   local editor-knowledge library. The source file allowlist stays fixed in code.
-6. Set `BUSINESS_KNOWLEDGE_SOURCE_ROOT` to the absolute directory containing
-   `startup-science/` and `marketing-wisdom/`. Only the two fixed source paths
-   are read.
-7. Set `AUTHOR_STYLE_SOURCE_ROOT` to the absolute path of your local
-   author-style library. Only the fixed title/body style files in `knowledge/`
-   are read.
-8. Set `METASKILL_SOURCE_ROOT` to the absolute path of your local metaskill
-   library. Only the fixed Markdown path allowlisted in code is read.
-9. Install dependencies:
+1. `.env.example` を `.env` にコピーし、自分の Notion / TiDB 設定を入れます。実 `.env` は Git 管理から除外されます。
+2. 通常の Notion ページ同期には `.env` の `MIRROR_CONFIG_JSON`、またはローカルの `mirror.config.json` で対象を指定します。
+3. ローカルのナレッジ同期を使う場合だけ、対応する `*_SOURCE_ROOT` を設定します。元のナレッジ本文はこのリポジトリには含みません。
+4. 依存をインストールします。
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
 ```
 
-## Commands
+実データを使わず構成を確認するには、[合成 Author Style サンプル](examples/author-style/README.md)を参照してください。
+このサンプルを Notion に配置した後の自動同期設定は、同期 Worker の README に記載しています。
+
+## コマンド
+
+次のコマンドは設定した接続先を操作します。`migrate*` はスキーマを変更し、`pull*` は同期先へ書き込みます。
+開発時に実データへ接続する必要はありません。
 
 ```bash
+# 通常の Notion ページ
 pnpm migrate
-pnpm pull
 pnpm pull -- --dry-run
-pnpm pull -- --page-id xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+pnpm pull
 pnpm doctor
-pnpm pull-editor-knowledge
+pnpm run search -- --query "検索語" --top-k 5
+
+# ローカルの editor / business / metaskill ナレッジ
+pnpm migrate-editor-knowledge
 pnpm pull-editor-knowledge -- --dry-run
+pnpm pull-editor-knowledge
 pnpm doctor-editor-knowledge
 pnpm migrate-business-knowledge
 pnpm pull-business-knowledge
-pnpm pull-business-knowledge -- --dry-run
 pnpm doctor-business-knowledge
-pnpm migrate-author-style
-pnpm pull-author-style
-pnpm pull-author-style -- --dry-run
-pnpm doctor-author-style
 pnpm migrate-metaskill
 pnpm pull-metaskill
-pnpm pull-metaskill -- --dry-run
 pnpm doctor-metaskill
+
+# Notion を正本にする Author Style
+pnpm migrate-author-style
+pnpm doctor-author-style
+pnpm preflight-author-style-notion -- --document-id example-body-style --page-id <your-page-id>
+
+# 同期ログ用のテーブル作成と状態の確認
+pnpm migrate-sync-state-log
+pnpm audit-sync-state
+
+# TiDB に保存された通常の Notion ページをローカルへ書き出す
 pnpm export-obsidian
-pnpm run search -- --query "some phrase" --top-k 5
-pnpm test
-pnpm typecheck
 ```
 
-Use `pnpm run search`; bare `pnpm search` is pnpm's registry search command.
+`pnpm run search` を使ってください。`pnpm search` は pnpm のパッケージ検索です。
+`preflight-author-style-notion` は Notion と保存済み snapshot の読み取りだけを行い、差分の内容を本文ごと表示せず比較します。
+`doctor-author-style` は snapshot を再解析し、ハッシュ、セクション、全用途の組み合わせを検証します。
 
-## Manual Smoke Test
-
-1. Run `pnpm migrate`.
-2. Run `pnpm pull -- --reindex`.
-3. Confirm TiDB has the configured seed pages plus any discovered child/link
-   pages in `notion_pages`.
-4. Run `pnpm doctor`; expect exit 0.
-5. Run `pnpm pull-editor-knowledge`, then `pnpm doctor-editor-knowledge`; expect
-   exactly 8 healthy rows in `editor_knowledge_documents`.
-6. Run `pnpm migrate-business-knowledge`; it applies only
-   `business-knowledge-schema.sql`, which contains two fixed
-   `CREATE TABLE IF NOT EXISTS` statements.
-7. Run `pnpm pull-business-knowledge`, then
-   `pnpm doctor-business-knowledge`; expect 2 documents, 325 active sections,
-   and 287 searchable spans.
-8. Run `pnpm export-obsidian`; expect Markdown files under the Obsidian vault's
-   `_notion_pages/` directory.
-9. Run `pnpm run search -- --query "<a phrase from the Notion page>" --top-k 5`;
-   expect rows with full-page Markdown excerpts.
-10. Run `pnpm migrate-author-style`, `pnpm pull-author-style`, and
-    `pnpm doctor-author-style`; expect 2 active documents and every routing
-    combination to fit without truncation.
-11. Run `pnpm migrate-metaskill`, `pnpm pull-metaskill`, and
-    `pnpm doctor-metaskill`; expect 1 active document, 40 delivery sections,
-    230 searchable spans, and all 69 valid routes to fit without truncation.
-
-## Obsidian Export
-
-Obsidian sync is local and automatic via launchd. The export command reads TiDB
-and writes generated Markdown files; it does not call the Notion API.
+## Author Style のバックアップと緊急復元
 
 ```bash
-pnpm export-obsidian
+pnpm export-author-style-markdown -- --document-id example-body-style
+pnpm restore-author-style-markdown -- --document-id example-body-style --input-path <snapshot.md> --dry-run
 ```
 
-Defaults:
+export はデフォルトで Git 管理対象外の `private-exports/` に Markdown と `.md.json` メタデータを書き出します。
+復元は両ファイルのハッシュ、parser / routing のバージョン、件数を検証します。
+実際に TiDB の snapshot を更新する場合だけ `--activate-emergency` を指定します。
+通常の更新は Notion の `Ready` → 同期 Worker の経路を使います。
 
-- vault: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents`
-- output: `_notion_pages`
+## その他の保存先
 
-Each generated note includes the required Obsidian properties plus the full
-Notion Markdown body. `_notion_pages/.notion-pages.json` keeps the pageId to
-filename mapping so title changes do not create duplicate files.
+| 入力 | 保存先 |
+| --- | --- |
+| 通常の Notion ページ | `notion_pages` に1ページ1行 |
+| 固定8件のローカル editor knowledge | `editor_knowledge_documents` に全文 |
+| Notion の編集・校正・メディア設計プレイブック | `editor_knowledge_documents` に全文 |
+| Notion の企画プレイブック・カタログ・全文資料 | 文書と `editor_knowledge_sections` に意味単位 |
+| 固定の business knowledge | `business_knowledge_documents` と revision 付き `business_knowledge_sections` |
+| Metaskill | `metaskill_documents` / `metaskill_revisions` / `metaskill_sections` |
 
-For launchd or cron usage, call:
+`migrate-editor-knowledge` は必要な列と section テーブルを追加します。
+固定ローカルファイルの一覧は `src/editorKnowledge.ts`、`src/businessKnowledge.ts`、`src/metaskill.ts` で管理します。
+参照先の Markdown は利用者が用意します。本や私的な文書の内容は配布していません。
 
-```text
-scripts/run-obsidian-sync.sh
-```
+## 旧 Author Style スキーマから更新する場合
 
-The script runs `pnpm pull` and then `pnpm export-obsidian`. Keep the actual
-LaunchAgent plist local because it usually contains machine-specific paths.
+`migrate-author-style` は current snapshot 用の列と新しい section テーブルを追加します。
+旧 `author_style_revisions` / `author_style_sections` の削除や既存データの自動変換は行いません。
+Notion に例示フォーマットのガイドを用意し、同期 Worker で再同期した後、`doctor-author-style` で検証してください。
+current snapshot が揃うまで MCP の接続先を切り替えず、既存データのバックアップを保持します。
 
-## Database Shape
+## Obsidian export
 
-These ten application tables are required:
-
-```sql
-notion_pages(page_id, title, markdown, markdown_sha256, truncated,
-  unknown_block_ids, last_synced_at, created_at, updated_at)
-
-editor_knowledge_documents(document_id, title, markdown, markdown_sha256,
-  last_synced_at, created_at, updated_at)
-
-business_knowledge_documents(document_id, title, source_path_key, source_kind,
-  ingest_scope, markdown, markdown_sha256, section_revision_sha256,
-  parser_version, sectioning_version, section_count, search_span_count,
-  outline_json, routing_metadata_json, last_synced_at, created_at, updated_at)
-
-business_knowledge_sections(document_id, section_id,
-  section_revision_sha256, parent_section_id, delivery_section_id,
-  heading_path_json, ordinal, source_line_start, source_line_end,
-  direct_markdown, section_markdown, retrieval_text, content_sha256,
-  is_searchable, related_source_path, freshness_class, last_synced_at,
-  created_at, updated_at)
-
-author_style_documents(document_id, author_key, style_scope, display_name,
-  source_path_key, active_revision_sha256, status, last_synced_at,
-  created_at, updated_at)
-
-author_style_revisions(document_id, revision_sha256, source_markdown,
-  source_markdown_sha256, parser_version, sectioning_version, routing_version,
-  routing_manifest_json, outline_json, section_count, delivery_section_count,
-  search_span_count, synced_at, created_at)
-
-author_style_sections(document_id, revision_sha256, section_id, context_key,
-  parent_section_id, delivery_section_id, section_type, content_layer,
-  context_priority, heading_path_json, aliases_json, ordinal,
-  direct_markdown, delivery_markdown, retrieval_text, content_sha256,
-  is_searchable, created_at, updated_at)
-
-metaskill_documents(document_id, display_name, source_path_key,
-  active_revision_sha256, status, last_synced_at, created_at, updated_at)
-
-metaskill_revisions(document_id, revision_sha256, source_markdown,
-  source_markdown_sha256, parser_version, sectioning_version, routing_version,
-  routing_manifest_json, outline_json, section_count, delivery_section_count,
-  search_span_count, synced_at, created_at)
-
-metaskill_sections(document_id, revision_sha256, section_id, context_key,
-  parent_section_id, delivery_section_id, section_type, content_layer,
-  context_priority, heading_path_json, aliases_json, ordinal,
-  direct_markdown, delivery_markdown, retrieval_text, content_sha256,
-  is_searchable, created_at, updated_at)
-```
-
-Business section rows are revisioned by source content plus parser versions.
-The sync does not delete old revisions and never writes to `notion_pages` or
-`editor_knowledge_documents`. Retention or cleanup is intentionally outside
-these commands.
-Author-style revisions follow the same append-only rule. The document row is
-switched to a new active revision only after its revision and all section rows
-are written in one transaction.
-Metaskill revisions use the same atomic active-revision switch and retain the
-raw transcription in `source_markdown`.
+`export-obsidian` は TiDB の保存済み Notion ページを読み取り、ローカルの `_notion_pages/` に Markdown を書き出します。
+Notion API は呼びません。出力先は `--vault-path` / `--output-dir` で指定できます。
+`scripts/run-obsidian-sync.sh` は通常ページの `pull` と export を順に実行するため、実行環境の認証設定が必要です。
+個人環境の LaunchAgent、生成された本文、状態ファイルはコミットしないでください。

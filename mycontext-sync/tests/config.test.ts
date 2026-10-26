@@ -43,6 +43,19 @@ describe("config", () => {
       title: "Env Profile"
     });
   });
+
+  it.each([
+    { pages: [] },
+    { pages: [{ pageId: "", title: "Example" }] },
+    { pages: [{ pageId: "page-1", title: "" }] },
+    { pages: [{ pageId: 123, title: "Example" }] }
+  ])("rejects invalid page config after the schema-library upgrade: %j", async (value) => {
+    const configPath = await writeConfig(value);
+    await expect(loadMirrorConfig(configPath)).rejects.toMatchObject({
+      code: "config_invalid",
+      exitCode: 3
+    });
+  });
 });
 
 async function writeConfig(value: unknown): Promise<string> {

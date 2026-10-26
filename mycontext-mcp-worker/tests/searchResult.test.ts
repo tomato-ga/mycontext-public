@@ -44,6 +44,31 @@ describe("buildSearchToolResult", () => {
         source_declared_at: null,
         detail_available: null,
         resource_uri: "mycontext://business-knowledge/startup-science/sections/detail-18"
+      },
+      {
+        document_id: "editor-knowledge:planning-catalog",
+        source: "editor_knowledge",
+        title: "企画カタログ427",
+        text: "### No.1 ｜ 最初の企画\n\n企画1の本文。",
+        match_position: 1,
+        matched_terms: ["企画1"],
+        score: 5,
+        search_stage: "keywords",
+        matched_span_position: 1,
+        matched_section_id: "no-001",
+        matched_section_title: "### No.1 ｜ 最初の企画",
+        matched_content_layer: "detail",
+        delivery_section_id: "no-001",
+        delivery_section_title: "### No.1 ｜ 最初の企画",
+        delivery_content_layer: "detail",
+        heading_path: ["企画カタログ427", "テーマ群A", "### No.1 ｜ 最初の企画"],
+        source_line_start: 6,
+        source_line_end: 8,
+        delivery_line_start: 6,
+        delivery_line_end: 8,
+        related_source_path: null,
+        freshness_class: "dated_example",
+        resource_uri: "mycontext://editor-knowledge/planning-catalog/sections/no-001"
       }
     ]);
 
@@ -57,8 +82,86 @@ describe("buildSearchToolResult", () => {
       id: "business-knowledge:startup-science#detail-18",
       matchedTerms: ["semantic"]
     });
+    // editor knowledge sectioned hits get the same "#deliverySectionId" stable ID treatment
+    // as business knowledge ones, since stableResultId no longer special-cases the source
+    expect(structured.results[2]).toMatchObject({
+      id: "editor-knowledge:planning-catalog#no-001",
+      matchedTerms: ["企画1"]
+    });
     expect(result.content).toHaveLength(1);
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect(JSON.stringify(result)).not.toContain("\"type\":\"resource\"");
+  });
+
+  it("returns a complete exact-ID analysis skill record through the legacy search tool", () => {
+    const markdown = `# Resolution Diagnose\n\n${"framework ".repeat(1_000)}`;
+    const result = buildSearchToolResult([{
+      document_id: "skill-context:resolution-diagnose",
+      source: "skill_context",
+      title: "resolution-diagnose",
+      text: markdown,
+      match_position: 1,
+      matched_terms: ["resolution-diagnose"],
+      score: 1000,
+      search_stage: "intent"
+    }]);
+    expect(result.structuredContent).toMatchObject({
+      results: [{
+        id: "skill-context:resolution-diagnose",
+        source: "skill_context",
+        contextChars: markdown.length,
+        retrievalMode: "full_skill_and_reference",
+        truncated: false
+      }]
+    });
+    expect(result.content).toEqual([{
+      type: "text",
+      text: expect.stringContaining(markdown)
+    }]);
+  });
+
+  it("returns a complete bounded document for an explicit intent or exact phrase", () => {
+    const playbook = "# メディア運営プレイブック\n\n全文";
+    const exactNotion = "# ガジェットプロフィール\n\n全文";
+    const result = buildSearchToolResult([
+      {
+        document_id: "editor-knowledge:media-design-playbook",
+        source: "editor_knowledge",
+        title: "メディア運営プレイブック",
+        text: playbook,
+        match_position: 1,
+        matched_terms: ["メディア運営プレイブック"],
+        score: 1000,
+        search_stage: "intent"
+      },
+      {
+        document_id: "notion:gadget-profile",
+        source: "notion",
+        title: "ガジェットプロフィール",
+        text: exactNotion,
+        match_position: 1,
+        matched_terms: ["ガジェットプロフィール"],
+        score: 100,
+        search_stage: "phrase"
+      }
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      results: [
+        {
+          contextChars: playbook.length,
+          retrievalMode: "full_exact_document",
+          truncated: false
+        },
+        {
+          contextChars: exactNotion.length,
+          retrievalMode: "full_exact_document",
+          truncated: false
+        }
+      ]
+    });
+    expect(result.content).toEqual([{
+      type: "text",
+      text: expect.stringMatching(/メディア運営プレイブック[\s\S]*ガジェットプロフィール/u)
+    }]);
   });
 });

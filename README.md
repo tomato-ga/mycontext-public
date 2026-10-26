@@ -1,334 +1,152 @@
 # mycontext-public
 
-`mycontext-public` は、`mycontext-mcp` の構成を再利用できるように汎用化した公開用サンプルです。Notion とローカル Markdown に置いた自分のコンテキストを、AI クライアントから読み取れる同期基盤を提供します。
+Notion とローカル Markdown のコンテキストを TiDB に保存し、Cloudflare Workers の Remote MCP から AI クライアントへ配信する公開サンプルです。2026-10-26 時点の構成を反映しています。
 
-このリポジトリには実際の Markdown コーパス、Notion page ID、ローカル絶対パス、デプロイ先ID、認証情報は含みません。設定例はすべてプレースホルダーです。
-
-Notion の対象ページを Markdown として TiDB に保存し、Cloudflare Workers 上の Remote MCP server から読み取り専用で公開します。Obsidian へは必要に応じてローカルで Markdown export します。
+[技術記事「記事再現ガイドを TiDB と Cloudflare Workers のリモート MCP サーバーにしてみた」](https://hfm.tokyo/blog/author-style-context-mcp)で紹介した、文体ガイドの意味単位での保存、用途別の取得、Notion からの同期を実装しています。著者の文体ガイドや個人データは含めず、サンプルの著者 ID、本文、設定値を使用します。
 
 ## 全体像
 
 ```text
-Notion pages
-  -> mycontext-sync
-  -> TiDB notion_pages
-Editor knowledge Markdown (fixed 8 files)
-  -> mycontext-sync
-  -> TiDB editor_knowledge_documents
-Business knowledge Markdown (fixed 2 files)
-  -> mycontext-sync section-aware parser
-  -> TiDB business_knowledge_documents + business_knowledge_sections
-Author-style Markdown (fixed title/body files)
-  -> mycontext-sync semantic parser + routing manifest
-  -> TiDB author_style_documents + revisions + sections
-Metaskill Markdown transcription (fixed 1 file)
-  -> mycontext-sync semantic parser + topic routing manifest
-  -> TiDB metaskill_documents + revisions + sections
-TiDB context tables
-  -> mycontext-mcp-worker
-  -> MCP tools + context packs + section Resources
-  -> MCP clients
+Notion documents (Status = Ready)
+  -> mycontext-sync-worker: signed webhook + Queue
+  -> validate Markdown and routing
+  -> TiDB current snapshots / sections
+  -> mycontext-mcp-worker: read-only MCP
+  -> AI clients
+
+Local Markdown / configured Notion pages
+  -> mycontext-sync: CLI import and validation
+  -> dedicated TiDB context tables
 
 TiDB notion_pages
   -> mycontext-sync export-obsidian
-  -> Obsidian _notion_pages/
+  -> local Markdown export
 ```
 
-このプロジェクトは「Notion 全体を検索できる巨大な RAG」ではなく、必要なページと固定ローカルMarkdownだけを同期する設計です。Notionとeditor knowledgeは1文書1行で保存し、business knowledge・author style・Metaskillは文字数ではなく原文の意味境界で保存します。embedding、ローカル MCP server、Worker 側の Notion API 呼び出しは持ちません。
-
-## コンポーネント
+読む Worker と書く Worker を分け、Notion API と TiDB の書き込み権限は同期側だけに持たせます。MCP Worker は同期済みのデータを読むだけです。対象は明示的に設定した文書に限定し、embedding は使用しません。
 
 | Path | 役割 |
 | --- | --- |
-| `mycontext-sync/` | Notionと固定ローカルコーパスを用途別テーブルへ保存する TypeScript CLI。TiDB から Obsidian へ Notion Markdownをexportするコマンドも持つ。 |
-| `mycontext-mcp-worker/` | TiDB の文書、意味section、選択式context packを公開する Cloudflare Workers Remote MCP server。既存 `/mcp` はOAuth 2.1保護、`/healthz` は公開liveness endpoint。 |
-| `docs/` | 個人データを公開repoから分離する方法と、公開前セキュリティレビュー。 |
+| [`mycontext-sync/`](mycontext-sync/README.md) | スキーマ作成、ローカル文書の取り込み、整合性検査、Markdown export / 緊急復旧を行う CLI。Author Style の parser と routing もここにあります。 |
+| [`mycontext-sync-worker/`](mycontext-sync-worker/README.md) | Notion の `Ready` を webhook と Queue で受け、検証済み文書を TiDB へ反映する同期 Worker。 |
+| [`mycontext-mcp-worker/`](mycontext-mcp-worker/README.md) | 認証付き Remote MCP。検索、文書取得、用途に応じたコンテキストの取得を提供します。 |
+| [`docs/author-style-context.md`](docs/author-style-context.md) | 記事の各ポイントと実装の対応、Author Style のデータモデルとサンプル。 |
 
-## 個人利用と公開repoの分離
+## Author Style の仕組み
 
-個人の Notion pageId/title、ローカルMarkdown同期元の絶対パス、Notion API key、TiDB credentials、OAuth secretsは公開repoに入れません。ローカルでは `mycontext-sync/.env` の `MIRROR_CONFIG_JSON` / `EDITOR_KNOWLEDGE_SOURCE_ROOT` / `BUSINESS_KNOWLEDGE_SOURCE_ROOT` / `AUTHOR_STYLE_SOURCE_ROOT` / `METASKILL_SOURCE_ROOT` と、Worker用の `.dev.vars` / Wrangler secrets で管理します。
+文書は `example-title-style` と `example-body-style` の2種類です。用途を指定すると、サーバーが必要なセクションを選び、1つの Markdown として返します。
 
-詳細は [docs/personal-use.md](docs/personal-use.md) を参照してください。push前には次を実行できます。
-
-```bash
-./scripts/check-public-safety.sh
+```json
+{
+  "name": "get_author_style_context",
+  "arguments": {
+    "documentId": "example-body-style",
+    "operation": "generate",
+    "mode": "explanatory",
+    "lengthBand": "2001plus",
+    "profile": "neutral"
+  }
+}
 ```
 
-## データモデル
+- 意味が完結する見出し単位を配信し、細かな検索ヒットは配信用の親セクションへ展開します。
+- `example-title/core` などの固定キーと routing manifest で、操作・記事の種類・長さから取得対象を決めます。
+- 通常の生成・編集用ルールと、統計などの根拠を分けます。根拠確認には `search_author_style_evidence` を使います。
+- 選択結果が上限45,000字を超えた場合はエラーにします。末尾の切り捨ては行いません。
 
-保存先は用途別の10テーブルです。
+保存先は現在の文書を持つ `author_style_documents` と、現在のセクションを持つ `author_style_current_sections` の2テーブルです。更新時は同じトランザクションで置き換え、検証失敗時には前の内容を維持します。`context_sha256` は同一性の確認に使い、Author Style の履歴テーブルは作りません。
 
-```sql
-notion_pages(
-  page_id,
-  title,
-  markdown,
-  markdown_sha256,
-  truncated,
-  unknown_block_ids,
-  last_synced_at,
-  created_at,
-  updated_at
-)
+合成サンプルは [`mycontext-sync/examples/author-style/`](mycontext-sync/examples/author-style/) にあります。parser は所定のアウトラインとキーを検証します。独自のガイドへ変更するときは、本文と parser / routing の契約をそろえて変更してください。
 
-editor_knowledge_documents(
-  document_id,
-  title,
-  markdown,
-  markdown_sha256,
-  last_synced_at,
-  created_at,
-  updated_at
-)
+## Notion からの同期
 
-business_knowledge_documents(
-  document_id,
-  title,
-  markdown,
-  markdown_sha256,
-  section_revision_sha256,
-  section_count,
-  search_span_count,
-  outline_json,
-  routing_metadata_json,
-  last_synced_at,
-  created_at,
-  updated_at
-)
+1. 同期 Worker の [README](mycontext-sync-worker/README.md)に従い、Notion data source と管理プロパティを作成します。
+2. タイトル用・本文用のサンプルを Notion に置き、それぞれの文書 ID と許可するページ ID を設定します。
+3. `mycontext-sync` で `pnpm migrate-author-style` と `pnpm migrate-sync-state-log` を実行し、Queue、Worker の環境設定を用意します。同期処理は Author Style だけの場合も状態ログへ書き込みます。
+4. Notion で編集を終え、Status を `Ready` にします。
+5. Worker が署名を検証したイベントを Queue へ送り、最新の本文・プロパティを検証して同期します。成功すると `Synced`、失敗すると `Error` または `Conflict` になります。
 
-business_knowledge_sections(
-  document_id,
-  section_id,
-  section_revision_sha256,
-  parent_section_id,
-  delivery_section_id,
-  title,
-  heading_path_json,
-  direct_markdown,
-  section_markdown,
-  retrieval_text,
-  source_line_start,
-  source_line_end,
-  is_searchable
-)
+同期 Worker は Notion の管理プロパティを更新します。ページ本文は更新しません。通常の Author Style 同期にローカル Markdown は使いません。
 
-author_style_documents(
-  document_id,
-  author_key,
-  style_scope,
-  active_revision_sha256,
-  status
-)
+## CLI とその他の文書
 
-author_style_revisions(
-  document_id,
-  revision_sha256,
-  source_markdown,
-  routing_manifest_json,
-  section_count,
-  delivery_section_count,
-  search_span_count
-)
-
-author_style_sections(
-  document_id,
-  revision_sha256,
-  section_id,
-  context_key,
-  delivery_section_id,
-  content_layer,
-  direct_markdown,
-  delivery_markdown,
-  retrieval_text
-)
-
-metaskill_documents(
-  document_id,
-  display_name,
-  active_revision_sha256,
-  status
-)
-
-metaskill_revisions(
-  document_id,
-  revision_sha256,
-  source_markdown,
-  routing_manifest_json,
-  section_count,
-  delivery_section_count,
-  search_span_count
-)
-
-metaskill_sections(
-  document_id,
-  revision_sha256,
-  section_id,
-  context_key,
-  delivery_section_id,
-  content_layer,
-  direct_markdown,
-  delivery_markdown,
-  retrieval_text
-)
-```
-
-`markdown_sha256` で内容差分を判定し、変更がない文書は同期時にskipできます。Business sectionはsource hashとparser/sectioning versionからrevisionを作り、過去revisionを削除せずにUPSERTします。`unknown_block_ids` と `truncated` は、Notion ブロック変換時の警告や制限を後から追えるように残します。
-
-## 同期の流れ
-
-1. `mycontext-sync/.env` の `MIRROR_CONFIG_JSON`、または gitignored な `mirror.config.json` に seed page を設定する。
-2. `pnpm migrate` で `notion_pages` と `editor_knowledge_documents` を作る。
-3. `pnpm pull` で Notion から Markdown を取得し、TiDB に upsert する。
-4. `pull` は seed page 配下の `child_page` と `link_to_page` を最大 200 ページまで探索する。
-5. `.env` の `EDITOR_KNOWLEDGE_SOURCE_ROOT` を設定し、`pnpm pull-editor-knowledge` で固定8件を差分同期する。
-6. `pnpm doctor-editor-knowledge` でローカルMarkdownとTiDBのハッシュ一致を検証する。
-7. `.env` の `BUSINESS_KNOWLEDGE_SOURCE_ROOT` を設定し、`pnpm migrate-business-knowledge`で専用2テーブルだけを作成する。
-8. `pnpm pull-business-knowledge`で固定2文書をsection-aware同期し、`pnpm doctor-business-knowledge`で原文・section revision・件数・hashを検証する。
-9. `.env` の `AUTHOR_STYLE_SOURCE_ROOT` を設定し、`pnpm migrate-author-style`、`pnpm pull-author-style`、`pnpm doctor-author-style`で固定2文書と全routing組合せを検証する。
-10. `.env` の `METASKILL_SOURCE_ROOT` を設定し、`pnpm migrate-metaskill`、`pnpm pull-metaskill`、`pnpm doctor-metaskill`で固定1文書・意味section・全topic routingを検証する。
-11. `pnpm run search` でNotion Markdownをローカル検証できる。
-12. 必要に応じて `pnpm export-obsidian` で Obsidian vault の `_notion_pages/` に Markdown を書き出す。
-
-Obsidian export は Notion API を呼びません。TiDB に保存済みの内容をローカルファイルへ反映するだけです。
-
-## Remote MCP
-
-`mycontext-mcp-worker` は Cloudflare Workers 上で動く読み取り専用 MCP server です。
-
-公開 endpoint:
-
-- `GET /healthz`: `ok` を返す liveness endpoint。
-- `/mcp`: OAuth 2.1 で保護された Streamable HTTP MCP endpoint。クライアント登録は DCR、認可コードは S256 PKCE を使う。
-- 本人確認は GitHub OAuth で行い、`GITHUB_ALLOWED_USER_ID` に設定した不変の数値 user ID だけを許可する。
-
-提供 tools:
-
-- `list_documents`: 同期済みNotion / `editor-knowledge` / `business-knowledge`文書一覧を名前空間付きIDで返す。
-- `search_context`: Notion/editor本文とbusinessの最小意味sectionを統合検索する。BusinessのH3ヒットは意味が完結するH2親sectionへ展開して返す。
-- `search_text`: `search_context` と同じ検索を明示的な text fallback として提供する。
-- `get_document`: 従来の`pageId`、名前空間付き`documentId`、またはbusiness `sectionId`で本文/sectionを返す。
-- `health_check`: TiDB接続、各sourceの文書件数、business section件数、合計件数を返す。
-- `get_author_style_context`: 文書種別・操作・モード・長さ・profileに応じた意味完結sectionを、通常利用向けの1パックとして返す。
-- `search_author_style_evidence`: 根拠確認時だけevidence/profile/ops層を検索し、ヒットした細粒度spanを意味完結sectionへ展開して返す。
-- `get_metaskill_context`: topic・intent・depthに応じた意味完結sectionを、通常利用向けの1パックとして返す。
-- `search_metaskill_evidence`: 用語・例・promptなどを細粒度spanで検索し、ヒットを意味完結sectionへ展開して返す。
-
-Business knowledge、author style、Metaskillは文書Resourceとsection Resource templateも公開します。MetaskillのURIは`mycontext://metaskill/ai-self-strategy`です。
-
-Worker は stateless です。Durable Objects、migrations、raw SQL tool、Notion API 呼び出しはありません。
-
-## セットアップ
-
-### Notion -> TiDB sync
+CLI のセットアップは [`mycontext-sync/README.md`](mycontext-sync/README.md) を参照してください。
 
 ```bash
 cd mycontext-sync
-pnpm install
+pnpm install --frozen-lockfile
 cp .env.example .env
+```
+
+ローカルの `.env` に接続情報を設定してから、スキーマを作成します。MCP の一般検索・文書取得・Resource 一覧は複数の保存先を参照するため、全体を使う場合は空のテーブルも含めて次の migration を実行してください。
+
+```bash
 pnpm migrate
-pnpm pull
-pnpm doctor
-pnpm pull-editor-knowledge
-pnpm doctor-editor-knowledge
+pnpm migrate-editor-knowledge
 pnpm migrate-business-knowledge
-pnpm pull-business-knowledge
-pnpm doctor-business-knowledge
 pnpm migrate-author-style
-pnpm pull-author-style
-pnpm doctor-author-style
 pnpm migrate-metaskill
-pnpm pull-metaskill
-pnpm doctor-metaskill
+pnpm migrate-sync-state-log
 ```
 
-`.env` には Notion integration secret、TiDB接続情報、必要なら`MIRROR_CONFIG_JSON`のNotion pageId/title、各`*_SOURCE_ROOT`の絶対パスを入れます。実値はcommitしません。`mirror.config.json`を使う場合もgitignoredなローカルファイルとして扱います。
+`get_author_style_context` だけを使う場合の読み取り先は Author Style の2テーブルです。Notion からの同期には状態ログも必要なので、専用構成でも `migrate-author-style` と `migrate-sync-state-log` の両方を実行します。この構成で他の保存先を参照する一般検索や Resource 一覧を使う場合は、上記の全スキーマも用意してください。
 
-検索:
+通常の Notion ページを取り込むには `pnpm pull`、取り込み結果の検査には `pnpm doctor` を使います。Author Style は Notion 同期後に `pnpm doctor-author-style` で検査できます。`migrate*` はスキーマを変更し、`pull` は設定した Notion ページを読み取って TiDB を更新します。
+
+文書の保存先は用途で分けています。
+
+| 文書 | 保存先 |
+| --- | --- |
+| 設定した Notion 文書・AI スキル | `notion_pages` |
+| 編集知識・プレイブック | `editor_knowledge_documents`、文書種別により `editor_knowledge_sections` |
+| Business knowledge | `business_knowledge_documents`、`business_knowledge_sections` |
+| Author Style | `author_style_documents`、`author_style_current_sections` |
+| Metaskill | `metaskill_documents`、`metaskill_revisions`、`metaskill_sections` |
+| 同期の状態遷移 | `context_sync_state_log` |
+
+Notion 文書は `pnpm run search -- --query "検索語" --top-k 5` で確認できます。`pnpm search` はパッケージ検索になるため、`run` を付けます。`pnpm export-obsidian` は TiDB の文書をローカルへ書き出し、Notion API を呼びません。
+
+## Remote MCP
+
+接続先と OAuth のセットアップは [`mycontext-mcp-worker/README.md`](mycontext-mcp-worker/README.md) を参照してください。
+
+- `GET /healthz`: 外部サービスを呼ばない liveness check。
+- `/mcp`: OAuth と `context:read` scope で保護された MCP endpoint。
+- 本人確認: GitHub OAuth と、設定した不変の数値 user ID による許可。
+
+一般の文書検索には `search_personal_context`、取得には `read_context` を使います。Author Style と Metaskill は専用のコンテキスト取得・根拠検索ツールを持ちます。企画・編集・校正・メディア設計・分析スキルの取得ツールも提供します。全11ツールの引数と接続方法は Worker の README を参照してください。
+
+分析スキルの `get_analysis_skill_context` と、その文書への検索・取得には任意の `skill_context_documents` が必要です。このテーブルの migration と取り込みコマンドは同梱していません。使う場合は利用者が別途用意してください。Author Style 専用ツールはこのテーブルを参照しません。
+
+## 設定と公開範囲
+
+実際の `.env`、`.dev.vars`、Notion page / data source ID、秘密情報、デプロイ先 ID、同期済み本文、バックアップは commit しません。各 Worker の設定例をローカルへコピーし、運用先ごとの値を設定してください。公開用の origin と KV ID はプレースホルダーのままです。
+
+詳細は [`docs/personal-use.md`](docs/personal-use.md)、権限と認証の境界は [`SECURITY.md`](SECURITY.md) を参照してください。
+
+## ローカル検証
+
+Node.js 22.22.3、pnpm 11.7.0 を使用します。
 
 ```bash
-pnpm run search -- --query "検索したい語句" --top-k 5
-```
+./scripts/check-public-safety.sh
 
-`pnpm search` は pnpm registry search なので使いません。
-
-Obsidian export:
-
-```bash
-pnpm export-obsidian
-```
-
-既定の出力先は macOS の iCloud Obsidian vault を想定しています。別の環境では `OBSIDIAN_VAULT_ROOT` と `OBSIDIAN_OUTPUT_DIR` をローカル設定してください。
-
-```text
-~/Library/Mobile Documents/iCloud~md~obsidian/Documents/_notion_pages
-```
-
-週次 export は launchd などから次の script を呼び出して実行できます。
-
-```text
-mycontext-sync/scripts/run-obsidian-sync.sh
-```
-
-実行時刻と LaunchAgent / cron の設定は環境ごとに決め、マシン固有の設定ファイルはリポジトリへ追加しないでください。
-
-### Remote MCP Worker
-
-```bash
-cd mycontext-mcp-worker
-pnpm install
-wrangler secret put TIDB_DATABASE_URL
-wrangler secret put GITHUB_CLIENT_ID
-wrangler secret put GITHUB_CLIENT_SECRET
-wrangler secret put GITHUB_ALLOWED_USER_ID
-pnpm run deploy
-```
-
-ローカル確認:
-
-```bash
-pnpm run dev
-curl -i http://localhost:8787/healthz
-curl -i http://localhost:8787/mcp
-```
-
-`/healthz` は `200 ok`、token なしの `/mcp` は `401` が期待値です。
-
-## 開発チェック
-
-各サブプロジェクトで実行します。
-
-```bash
+cd mycontext-sync
+pnpm install --frozen-lockfile
 pnpm run typecheck
 pnpm test
-pnpm audit --audit-level moderate
+
+cd ../mycontext-mcp-worker
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
+pnpm run deploy:dry-run
+
+cd ../mycontext-sync-worker
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
+pnpm run deploy:dry-run
 ```
 
-`mycontext-sync` では実データ確認として次も使います。
-
-```bash
-pnpm pull -- --dry-run
-pnpm pull -- --reindex
-pnpm doctor
-pnpm pull-editor-knowledge -- --dry-run
-pnpm pull-editor-knowledge -- --reindex
-pnpm doctor-editor-knowledge
-pnpm pull-business-knowledge -- --dry-run
-pnpm pull-business-knowledge -- --reindex
-pnpm doctor-business-knowledge
-pnpm pull-author-style -- --dry-run
-pnpm pull-author-style -- --reindex
-pnpm doctor-author-style
-```
-
-## 設計判断
-
-- 対象は `mirror.config.json` の seed page と、そこから辿れる child/link page に限定する。
-- TiDBには用途別テーブルで全文Markdownを保存し、business knowledgeだけは著者定義section treeも保存する。文字数によるsection結合・分割はしない。
-- Business検索は最小sectionで行い、AIへは`delivery_section_id`が示す意味完結した親sectionを返す（Small2Big）。
-- Business同期は新規2テーブルと固定2文書IDだけへUPSERTし、`DELETE`/`TRUNCATE`/`DROP`を持たない。
-- Author styleは3専用テーブルへ細粒度保存するが、AIにはWorkerが選択・結合した1コンテキストパックを返す。通常経路で全文や任意文字chunkを読ませない。
-- Worker は read-only にする。書き込み、migration、Notion API 取得は CLI 側に閉じる。
-- Obsidian は Worker から直接触らず、ローカル export と launchd で扱う。
-- embedding や chunk table は、必要性が確認できるまで入れない。
-
-この構成により、認証情報と書き込み権限を同期CLIに寄せ、外部公開する MCP endpoint は最小の読み取り面だけにできます。
+これらは型・テスト・公開対象・ビルドの検証です。実際の Notion / TiDB 接続や OAuth の疎通は、利用者自身の環境設定後に確認してください。

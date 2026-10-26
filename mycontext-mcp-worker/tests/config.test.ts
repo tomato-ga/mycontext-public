@@ -2,23 +2,23 @@ import { describe, expect, it } from "vitest";
 import { ConfigError, loadAuthConfig, loadConfig, type EnvSource } from "../src/config.js";
 
 const completeEnv: EnvSource = {
-  TIDB_DATABASE_URL: "mysql://mcp-reader.example.invalid/notion_context",
+  TIDB_DATABASE_URL: "mysql://mcp-reader.example.invalid/example_context",
   GITHUB_CLIENT_ID: "github-client-id",
-  GITHUB_CLIENT_SECRET: "github-client-secret",
+  GITHUB_CLIENT_SECRET: "<github-client-secret>",
   GITHUB_ALLOWED_USER_ID: "12345678"
 };
 
 describe("loadConfig", () => {
   it("loads required configuration", () => {
     expect(loadConfig(completeEnv)).toMatchObject({
-      tidbDatabaseUrl: "mysql://mcp-reader.example.invalid/notion_context"
+      tidbDatabaseUrl: "mysql://mcp-reader.example.invalid/example_context"
     });
   });
 
   it("loads GitHub authorization configuration", () => {
     expect(loadAuthConfig(completeEnv)).toEqual({
       githubClientId: "github-client-id",
-      githubClientSecret: "github-client-secret",
+      githubClientSecret: "<github-client-secret>",
       githubAllowedUserId: 12345678
     });
   });

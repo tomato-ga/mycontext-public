@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { AUTHOR_STYLE_DOCUMENT_IDS } from "../authorStyle.js";
 import { MCP_SCOPE } from "../constants.js";
@@ -8,6 +8,7 @@ import {
   validateTopK,
   type TidbClient
 } from "../tidb.js";
+import { buildTextToolResult } from "./textResult.js";
 
 export function registerSearchAuthorStyleEvidenceTool(
   server: McpServer,
@@ -18,12 +19,12 @@ export function registerSearchAuthorStyleEvidenceTool(
     {
       title: "Search author style evidence",
       description:
-        "Audit path for searching evidence, profile, and maintenance sections in ore's title/body style sources. Returns each complete semantic delivery section, not arbitrary text chunks.",
-      inputSchema: {
+        "Audit path for searching evidence, profile, and maintenance sections in the example author's title/body style sources. Returns each complete semantic delivery section, not arbitrary text chunks.",
+      inputSchema: z.object({
         documentId: z.enum(AUTHOR_STYLE_DOCUMENT_IDS),
         query: z.string().trim().min(1).max(1_000),
         topK: z.number().optional().describe("Integer from 1 to 5; defaults to 3.")
-      },
+      }),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -49,10 +50,7 @@ export function registerSearchAuthorStyleEvidenceTool(
               "",
               hit.markdown
             ].join("\n")).join("\n\n---\n\n");
-        return {
-          content: [{ type: "text" as const, text }],
-          structuredContent: { query, document_id: documentId, hits: metadata }
-        };
+        return buildTextToolResult(text, { query, document_id: documentId, hits: metadata });
       } catch (error) {
         if (error instanceof TopKValidationError) {
           return {

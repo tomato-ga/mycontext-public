@@ -1,214 +1,76 @@
 # mycontext-mcp-worker
 
-Read-only Remote MCP server for synced Notion, editor knowledge, sectioned
-business knowledge, routed author-style context, and the Metaskill
-transcription stored in TiDB Cloud.
+TiDB に同期されたコンテキストを、Cloudflare Workers の読み取り専用 Remote MCP で配信します。データの書き込みは `../mycontext-sync-worker/` とローカル CLI が担当します。この公開版の文書 ID・Worker origin・KV 設定はサンプルです。個人の文書本文やデプロイ設定は含みません。
 
-This Worker exposes Streamable HTTP at `/mcp` and a public non-secret liveness
-endpoint at `/healthz`.
+## 実装とプロトコル
 
-## Design
+- MCP stable `2026-07-28`。[`Streamable HTTP`](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) と [`Tools`](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) を参照。
+- `@modelcontextprotocol/server` / `@modelcontextprotocol/client` `2.3.1`、`agents` `0.28.1`。旧クライアントの互換テストには SDK `1.32.1` を使用します。
+- `/mcp` は OAuth bearer token で保護します。GitHub OAuth、PKCE S256、許可する GitHub user ID を利用します。
+- 現行の `server/discover` と旧来の `initialize` を、stateless HTTP で扱います。ブラウザの Origin 構文と Host を検証し、認証済みリクエストに同じ読み取り専用ツールを提供します。
+- `GET /healthz` は認証不要の生存確認です。DB の内容を返しません。
 
-- Runtime: Cloudflare Workers with `nodejs_compat` for the `agents/mcp` bundle.
-- MCP transport: stateless `createMcpHandler()` from `agents/mcp`.
-- OAuth state: Cloudflare Workers KV. No Durable Objects, no `McpAgent`, no migrations.
-- Database: TiDB Cloud Serverless Driver over HTTP via `@tidbcloud/serverless`;
-  no TCP/mysql2 connection is used.
-- Data access: read-only SQL against `notion_pages`,
-  `editor_knowledge_documents`, `business_knowledge_documents`, and
-  `business_knowledge_sections`, plus the three dedicated `author_style_*`
-  and three dedicated `metaskill_*` tables. Full general documents use a fixed
-  Worker-side `UNION ALL` read model; author style and Metaskill remain on
-  dedicated retrieval paths.
-- Search:
-  - `search_personal_context`: full-phrase search followed by bounded Japanese
-    keyword extraction, title-weighted OR ranking, and a small synonym fallback.
-    Business knowledge searches the smallest semantic spans and expands each
-    hit to its complete delivery section (Small2Big).
-- Auth: OAuth 2.1 authorization code flow with S256 PKCE. Cloudflare's OAuth
-  provider issues and validates MCP access and refresh tokens.
-- Session continuity: `offline_access` is advertised and accepted alongside
-  the required `context:read` scope so compatible clients can refresh access.
-- Identity: GitHub OAuth is used only to authenticate the resource owner. Access
-  is restricted to the immutable numeric GitHub user ID in
-  `GITHUB_ALLOWED_USER_ID`; the upstream GitHub token is not persisted.
-- Discovery: RFC 8414 authorization-server metadata, RFC 9728 protected-resource
-  metadata (including the path-aware `/mcp` document), and standard dynamic
-  client registration (DCR). CIMD is intentionally disabled so clients use the
-  broadly compatible public-client + PKCE flow.
-- Scope: all tools require `context:read` and are marked read-only.
-- `/healthz`: public and returns only `ok`.
+## Author Style
 
-The Worker does not call the Notion API, does not read or write Obsidian files,
-does not run migrations, and does not expose a raw SQL tool.
+`get_author_style_context` は、文書・操作・用途・長さを指定すると、必要な意味セクションをまとめて返します。
 
-## Tools
-
-- `search_personal_context`: accepts the user's full question and returns
-  compact ranked candidates with stable IDs.
-- `read_context`: accepts exactly one stable ID returned by search and returns
-  the selected Markdown once.
-- `get_author_style_context`: normal generation/edit/evaluation path; returns
-  one selector-specific context pack without truncating semantic sections.
-- `search_author_style_evidence`: audit path over evidence/profile/ops layers;
-  matched spans expand to complete delivery sections.
-- `get_metaskill_context`: normal topic/intent/depth path; returns one complete
-  context pack without truncating selected semantic sections.
-- `search_metaskill_evidence`: fine-grained search path for terms, examples,
-  prompts, and supporting passages; hits expand to complete delivery sections.
-
-Document IDs are namespaced as `notion:<page-id>` and
-`editor-knowledge:<document-id>` or `business-knowledge:<document-id>`.
-`read_context` accepts the namespaced document ID directly, or a semantic
-section ID in `business-knowledge:<document-id>#<local-section-id>` format.
-Clients should copy the returned search ID unchanged rather than constructing it.
-
-## Resources
-
-The two source documents are available at:
-
-```text
-mycontext://business-knowledge/startup-science
-mycontext://business-knowledge/marketing-wisdom
+```json
+{
+  "name": "get_author_style_context",
+  "arguments": {
+    "documentId": "example-body-style",
+    "operation": "generate",
+    "mode": "explanatory",
+    "lengthBand": "2001plus"
+  }
+}
 ```
 
-Active semantic sections use this template:
+`author_style_documents` と `author_style_current_sections` の current snapshot を使用します。H3 で根拠を検索した場合も、配信は親の意味単位を返します。routing manifest の上限を超えた場合は、選んだセクションを切り捨てずエラーにします。`search_author_style_evidence` と `mycontext://author-style/...` resources は根拠・原文の確認用です。
 
-```text
-mycontext://business-knowledge/{documentId}/sections/{sectionId}
-```
+## その他の取得ツール
 
-Search results use compact structured candidates and one short text summary;
-they do not duplicate the same payload as JSON, resources, and resource links.
-Only section rows whose
-`section_revision_sha256` matches the owning document are visible. Business
-results and resources expose `source_kind`, `ingest_scope`,
-`source_declared_at`, `detail_available`, content layers, freshness, and any
-relative `related_source_path`, so an index-only source is not mistaken for
-stored detail.
+- `search_personal_context` / `read_context`: 同期済み文書の検索・全文取得。
+- `get_planning_playbook_context`, `get_editing_playbook_context`, `get_kosei_playbook_context`, `get_media_playbook_context`: 用途別プレイブックの一括取得。
+- `get_metaskill_context` / `search_metaskill_evidence`: topic / intent / depth に応じた取得と根拠検索。
+- `get_analysis_skill_context`: 保存済み分析スキルの取得。
 
-Operational health remains available at `/healthz`; it is not exposed as a
-general conversation tool.
+これらは利用者が自分の文書を同期して初めて内容を返します。公開用サンプルに私的な教材・書籍本文・文体ガイドは含めていません。
 
-Author-style full-source audit resources are available at:
-
-```text
-mycontext://author-style/example-title-style
-mycontext://author-style/example-body-style
-mycontext://author-style/{documentId}/sections/{sectionId}
-```
-
-Normal AI work should call `get_author_style_context`; full-source Resources
-exist for audit and maintenance. The tool emits the context Markdown once in
-MCP text content while structured content contains metadata only.
-
-Metaskill full-source and semantic-section resources are available at:
-
-```text
-mycontext://metaskill/ai-self-strategy
-mycontext://metaskill/{documentId}/sections/{sectionId}
-```
-
-Normal AI work should call `get_metaskill_context`. Prompt and example blocks
-are returned as delimited reference material, not as caller instructions.
-
-The TiDB reader used by `TIDB_DATABASE_URL` needs `SELECT` on all context tables:
-
-```sql
-GRANT SELECT ON notion_context.editor_knowledge_documents TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.business_knowledge_documents TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.business_knowledge_sections TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.author_style_documents TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.author_style_revisions TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.author_style_sections TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.metaskill_documents TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.metaskill_revisions TO '<reader-user>'@'%';
-GRANT SELECT ON notion_context.metaskill_sections TO '<reader-user>'@'%';
-```
-
-## Environment
-
-Local development uses `.dev.vars` and production should use Wrangler secrets.
-Do not commit real values.
+## ローカル検証
 
 ```bash
-TIDB_DATABASE_URL=mysql://<user>:<password>@<host>/<database>
-GITHUB_CLIENT_ID=<github-oauth-app-client-id>
-GITHUB_CLIENT_SECRET=<github-oauth-app-client-secret>
-GITHUB_ALLOWED_USER_ID=<numeric-github-user-id>
-```
-
-If real credentials were ever shared in prompts, attachments, logs, or committed
-files, rotate the TiDB password and OAuth app secret before using this endpoint
-in production.
-
-## Deploy
-
-```bash
-pnpm install
-
-wrangler secret put TIDB_DATABASE_URL
-wrangler secret put GITHUB_CLIENT_ID
-wrangler secret put GITHUB_CLIENT_SECRET
-wrangler secret put GITHUB_ALLOWED_USER_ID
-
-pnpm run deploy
-```
-
-This publishes to the Worker URL assigned by Cloudflare. A custom domain is not
-configured in `wrangler.jsonc`. Before deploying, create two KV namespaces,
-replace both `REPLACE_WITH_*_KV_NAMESPACE_ID` placeholders, and replace the
-example `PUBLIC_ORIGIN` in `src/constants.ts` with the assigned Worker URL.
-
-## Local Dev
-
-```bash
-pnpm install
-pnpm run dev
-```
-
-Verify:
-
-```bash
-curl -i http://localhost:8787/healthz
-curl -i http://localhost:8787/mcp
-```
-
-The first command should return `200 ok`; the second should return `401` with a
-`WWW-Authenticate` header pointing to protected-resource metadata.
-
-Register the same standard endpoint in ChatGPT Web, Codex, and Claude Code:
-
-```text
-https://mycontext-mcp.example.workers.dev/mcp
-```
-
-The hostname above is a documentation placeholder; it is not a live service.
-
-The client discovers OAuth automatically. The GitHub OAuth App callback URL is:
-
-```text
-https://mycontext-mcp.example.workers.dev/oauth/github/callback
-```
-
-After changing tool descriptors or OAuth metadata, disconnect and reconnect the
-client integration so it refreshes the tool and authorization snapshots.
-
-## Development Checks
-
-```bash
+pnpm install --frozen-lockfile --strict-peer-dependencies
 pnpm run typecheck
 pnpm test
-pnpm run test:live-author-style
-pnpm run test:live-metaskill
+pnpm run deploy:dry-run
 ```
 
-Wrangler observability is enabled for sampled logs and traces. Tool logs record
-query length and a SHA-256 query hash, not the raw query or returned Markdown.
+テストは合成データと mock を使います。実環境の env や TiDB には接続しません。
 
-The live author-style smoke test uses the read-only `TIDB_DATABASE_URL` from
-`.dev.vars`, lists both MCP tools through an in-memory MCP transport, and calls
-title context, body context, and evidence search against current TiDB data.
-The live Metaskill test similarly lists both dedicated tools, calls context and
-evidence retrieval, and reads document/section resources against current TiDB
-data.
+## データベースの準備
+
+Author Style の専用取得は `author_style_documents` と `author_style_current_sections` を使います。一般検索・`read_context`・`resources/list` も使う場合は、`../mycontext-sync/` で必要な全テーブルを準備してください。
+
+```bash
+pnpm migrate
+pnpm migrate-editor-knowledge
+pnpm migrate-business-knowledge
+pnpm migrate-author-style
+pnpm migrate-metaskill
+pnpm migrate-sync-state-log
+```
+
+これらの migration は空の構造を作ります。文書本文は利用者が自分で同期します。`skill_context_documents` の schema と取り込みはこのサンプルに含めていません。`get_analysis_skill_context`、分析スキルIDでの検索・`read_context` は、そのテーブルを別途準備した場合に利用できます。
+
+## 自分の環境で使う
+
+1. `src/constants.ts` のサンプル origin を自分の Worker URL に置き換える。GitHub OAuth callback はその origin の `/oauth/github/callback` とする。
+2. `wrangler.jsonc` の KV namespace プレースホルダーを自分の namespace に置き換える。`OAUTH_KV` と `AUTH_KV` は分ける。
+3. `.dev.vars.example` を参考にローカル `.dev.vars` または Cloudflare secrets を設定する。MCP 用 TiDB user は読み取り権限だけにする。
+4. 必要なら `PERSONAL_SYNONYMS` に自分の検索別名を設定する。未設定なら別名展開なしで動作する。
+5. デプロイ前に repository root の `scripts/check-public-safety.sh` と上記の検証を実行する。
+
+`pnpm deploy` は `scripts/release.mjs` のガード付きリリースです。事前検証、公開 endpoint の transport 確認、失敗時の rollback を行います。既存の active version を前提とするため、初回の作成は自分の Cloudflare アカウントと設定を確認してから行ってください。公開 endpoint の検証は `pnpm run verify:public-mcp` で行えます。repository の更新やテストだけでは本番デプロイは行いません。
+
+OAuth/DCR endpoint の rate limit は、公開運用する Cloudflare 側で設定してください。実際の secret、KV ID、個人の文書や検索別名は commit しないでください。
