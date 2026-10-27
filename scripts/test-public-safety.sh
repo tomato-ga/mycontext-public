@@ -39,6 +39,8 @@ assert_rejects() {
 dummy_secret="$(printf 'A%.0s' {1..40})"
 dummy_short_secret="$(printf 'B%.0s' {1..16})"
 dummy_id="$(printf 'b%.0s' {1..32})"
+dummy_upper_id="$(printf 'B%.0s' {1..32})"
+dummy_upper_uuid="${dummy_upper_id:0:8}-${dummy_upper_id:8:4}-${dummy_upper_id:12:4}-${dummy_upper_id:16:4}-${dummy_upper_id:20:12}"
 
 new_case
 mkdir -p "$case_dir/mycontext-sync" "$case_dir/mycontext-sync-worker"
@@ -49,6 +51,8 @@ for secret_name in NOTION_API_TOKEN NOTION_WEBHOOK_BOOTSTRAP_SECRET NOTION_WEBHO
 done
 printf '{"pageId":"REPLACE_WITH_PAGE_ID","authorKey":"example-author"}\n' > "$case_dir/example.json"
 printf 'NOTION_WEBHOOK_VERIFICATION_TOKEN: config.notionWebhookVerificationToken,\n' > "$case_dir/config-reference.ts"
+printf 'GITHUB_ALLOWED_USER_ID=12345678\n' > "$case_dir/example-user.txt"
+printf '%s\n' 'https://service.example.workers.dev' > "$case_dir/example-origin.txt"
 assert_passes 'placeholder examples and generic author keys'
 
 new_case
@@ -147,5 +151,47 @@ new_case
 mkdir -p "$case_dir/mycontext-sync"
 printf '%s%s\n' 'ntn_' "$dummy_secret" > "$case_dir/mycontext-sync/pnpm-lock.yaml"
 assert_rejects 'token in dependency metadata' 'pnpm-lock.yaml'
+
+new_case
+printf '\n# %s%s\n' 'ntn_' "$dummy_secret" >> "$case_dir/scripts/check-public-safety.sh"
+assert_rejects 'token in the safety checker itself' 'scripts/check-public-safety.sh'
+
+new_case
+printf '\n# %s%s\n' 'ntn_' "$dummy_secret" >> "$case_dir/scripts/check-public-safety.sh"
+git -C "$case_dir" add scripts/check-public-safety.sh
+cp "$ROOT_DIR/scripts/check-public-safety.sh" "$case_dir/scripts/check-public-safety.sh"
+assert_rejects 'staged token in a cleaned safety checker' 'scripts/check-public-safety.sh (index)'
+
+new_case
+printf 'GITHUB_ALLOWED_USER_ID=%s\n' '98765432' > "$case_dir/user-id.txt"
+git -C "$case_dir" add user-id.txt
+printf 'GITHUB_ALLOWED_USER_ID=<numeric-github-user-id>\n' > "$case_dir/user-id.txt"
+assert_rejects 'staged user ID behind a placeholder' 'user-id.txt (index)'
+
+new_case
+printf 'GITHUB_ALLOWED_USER_ID=%s; GITHUB_ALLOWED_USER_ID=%s\n' '12345678' '98765432' > "$case_dir/user-id.txt"
+assert_rejects 'user ID sharing a line with an allowed example' 'user-id.txt'
+
+for dummy_user_id in 912345678 123456789; do
+  new_case
+  printf 'GITHUB_ALLOWED_USER_ID=%s\n' "$dummy_user_id" > "$case_dir/user-id.txt"
+  assert_rejects 'user ID containing the allowed example as a substring' 'user-id.txt'
+done
+
+new_case
+printf 'accountId: "%s"\n' "$dummy_upper_id" > "$case_dir/config.ts"
+assert_rejects 'uppercase deployment ID' 'config.ts'
+
+new_case
+printf 'NOTION_DATA_SOURCE_ID="%s"\n' "$dummy_upper_id" > "$case_dir/config.txt"
+assert_rejects 'uppercase compact Notion ID' 'config.txt'
+
+new_case
+printf 'AUTHOR_STYLE_TITLE_PAGE_ID="%s"\n' "$dummy_upper_uuid" > "$case_dir/config.txt"
+assert_rejects 'uppercase UUID Notion ID' 'config.txt'
+
+new_case
+printf '%s%s%s\n' 'https://service.' 'synthetic-tenant' '.workers.dev' > "$case_dir/origin.txt"
+assert_rejects 'deployment Worker origin' 'origin.txt'
 
 printf 'Public safety regression checks passed: %s cases.\n' "$test_count"

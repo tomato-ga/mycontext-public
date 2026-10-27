@@ -10,34 +10,36 @@ list_public_files() {
 
 is_scannable_text() {
   local file="$1"
-
-  case "$file" in
-    scripts/check-public-safety.sh)
-      return 1
-      ;;
-  esac
-
   [[ -f "$file" ]] && LC_ALL=C grep -Iq . "$file"
+}
+
+has_disallowed_match() {
+  local pattern="$1"
+  local allowed_match_pattern="${2:-}"
+
+  if [[ -n "$allowed_match_pattern" ]]; then
+    LC_ALL=C grep -IEo "$pattern" | LC_ALL=C grep -Ev "$allowed_match_pattern" >/dev/null
+  else
+    LC_ALL=C grep -IE "$pattern" >/dev/null
+  fi
 }
 
 scan_pattern() {
   local pattern="$1"
+  local allowed_match_pattern="${2:-}"
   local file
 
   while IFS= read -r -d '' file; do
-    if is_scannable_text "$file" && LC_ALL=C grep -Eq "$pattern" "$file"; then
+    if is_scannable_text "$file" &&
+      has_disallowed_match "$pattern" "$allowed_match_pattern" < "$file"; then
       printf '%s\n' "$file"
     fi
   done < <(list_public_files)
 
   # A cleaned working copy must not hide an older staged value.
   while IFS= read -r -d '' file; do
-    case "$file" in
-      scripts/check-public-safety.sh)
-        continue
-        ;;
-    esac
-    if git show ":$file" 2>/dev/null | LC_ALL=C grep -IE "$pattern" >/dev/null; then
+    if git show ":$file" 2>/dev/null |
+      has_disallowed_match "$pattern" "$allowed_match_pattern"; then
       printf '%s (index)\n' "$file"
     fi
   done < <(git diff --name-only -z)
@@ -89,7 +91,7 @@ if [[ -n "$secret_hits" ]]; then
   exit 1
 fi
 
-private_identifier_hits="$(scan_pattern '(/Users/[A-Za-z0-9._-]+|/Volumes/[A-Za-z0-9._ -]+|/home/[A-Za-z0-9._-]+|[A-Za-z]:\\\\Users\\\\[A-Za-z0-9._-]+|[A-Za-z0-9._%+-]+@(gmail|icloud|me|outlook|yahoo)\.[A-Za-z]{2,}|servicedake\.workers\.dev|noteAI|(^|[^A-Za-z0-9_])ore-(title|body)([^A-Za-z0-9_]|$)|authorKey["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"']ore["'"'"'])' || true)"
+private_identifier_hits="$(scan_pattern '(/Users/[A-Za-z0-9._-]+|/Volumes/[A-Za-z0-9._ -]+|/home/[A-Za-z0-9._-]+|[A-Za-z]:\\\\Users\\\\[A-Za-z0-9._-]+|[A-Za-z0-9._%+-]+@(gmail|icloud|me|outlook|yahoo)\.[A-Za-z]{2,})' || true)"
 
 if [[ -n "$private_identifier_hits" ]]; then
   echo "Public safety check failed: possible personal or local identifiers found." >&2
@@ -97,10 +99,18 @@ if [[ -n "$private_identifier_hits" ]]; then
   exit 1
 fi
 
-environment_id_hits="$(scan_pattern '["'"'"']?(id|account_id|accountId|namespace_id|namespaceId)["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"'][a-f0-9]{32}["'"'"']' || true)"
+workers_origin_hits="$(scan_pattern '[[:alnum:]][[:alnum:].-]*\.workers\.dev' '(^|[.])example[.]workers[.]dev$' || true)"
+
+if [[ -n "$workers_origin_hits" ]]; then
+  echo "Public safety check failed: possible deployment Worker origins found." >&2
+  printf '%s\n' "$workers_origin_hits" >&2
+  exit 1
+fi
+
+environment_id_hits="$(scan_pattern '["'"'"']?(id|account_id|accountId|namespace_id|namespaceId)["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"'][a-fA-F0-9]{32}["'"'"']' || true)"
 
 notion_id_hits="$(
-  scan_pattern '(PAGE_ID|DATABASE_ID|DATA_SOURCE_ID|pageId|page_id|databaseId|database_id|dataSourceId|data_source_id)[^[:cntrl:]]{0,48}["'"'"']([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["'"'"']' || true
+  scan_pattern '(PAGE_ID|DATABASE_ID|DATA_SOURCE_ID|pageId|page_id|databaseId|database_id|dataSourceId|data_source_id)[^[:cntrl:]]{0,48}["'"'"']([a-fA-F0-9]{32}|[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})["'"'"']' || true
 )"
 
 if [[ -n "$notion_id_hits" ]]; then
@@ -115,15 +125,8 @@ if [[ -n "$environment_id_hits" ]]; then
   exit 1
 fi
 
-github_user_id_hits="$(
-  while IFS= read -r -d '' file; do
-    if is_scannable_text "$file" &&
-      LC_ALL=C grep -E 'GITHUB_ALLOWED_USER_ID[^0-9]*[0-9]{6,}' "$file" |
-        LC_ALL=C grep -Ev '12345678' >/dev/null; then
-      printf '%s\n' "$file"
-    fi
-  done < <(list_public_files)
-)"
+github_user_id_pattern="GITHUB_ALLOWED_USER_ID[\"']?[[:space:]]*[=:][[:space:]]*[\"']?[0-9]{6,}"
+github_user_id_hits="$(scan_pattern "$github_user_id_pattern" '(^|[^0-9])12345678$' || true)"
 
 if [[ -n "$github_user_id_hits" ]]; then
   echo "Public safety check failed: possible real GitHub user IDs found." >&2

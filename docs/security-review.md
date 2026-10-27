@@ -1,6 +1,6 @@
 # Publication Security Review
 
-Updated: 2026-10-26
+Updated: 2026-10-27
 
 This document describes the public sample's publication boundaries. It does not certify a live deployment or access to private Notion / TiDB data.
 
@@ -34,7 +34,7 @@ Local checks should cover the public-safety scan, frozen dependency installation
 
 These checks do not verify live OAuth, real secrets, Notion integration permissions, webhook delivery, TiDB grants, or Cloudflare rate limits. A dry-run confirms that the Worker builds; it does not deploy it.
 
-### Verification record for this update
+### Verification record for the 2026-10-26 update
 
 The following checks were completed for the sanitized publication update. They use synthetic data and do not connect to private services.
 
@@ -47,3 +47,11 @@ The following checks were completed for the sanitized publication update. They u
 - Dependency audits: all three projects reported no known vulnerabilities after patched dependency updates. The scoped Undici overrides in the Worker workspaces replace Miniflare's pinned vulnerable patch with a compatible fix.
 - Documentation: relative links resolve, and initialization distinguishes Author Style synchronization from the full MCP schema requirements.
 - Live deployment or private data operations: outside the publication update scope.
+
+### Publication recheck on 2026-10-27
+
+The published `main` history (three commits and 294 unique blobs) was checked again, including the safety checker itself, dependency metadata, fixtures, and commit identities. Private configuration values and private document excerpts were compared locally without displaying them. No credential, private document body, real environment file, or real account / page ID was found. The four publication CI job logs were also checked; there were no uploaded workflow artifacts.
+
+The recheck found deployment and project labels in the safety checker's deny patterns. Those labels have been removed from the current code, and the checker no longer excludes itself. Worker-origin detection now uses a generic rule with an explicit example-host exception. Staged GitHub user IDs, exact placeholder boundaries, and uppercase deployment / Notion IDs are checked as well. The regression suite now covers 37 cases.
+
+Earlier revisions still contain those former detection-pattern labels. They are environment identifiers rather than credentials; this repair preserves published Git history. No credential revocation or history rewrite was performed.
