@@ -2,7 +2,7 @@
 
 Notion とローカル Markdown のコンテキストを TiDB に保存し、Cloudflare Workers の Remote MCP から AI クライアントへ配信する公開サンプルです。2026-10-26 時点の構成を反映しています。
 
-[技術記事「記事再現ガイドを TiDB と Cloudflare Workers のリモート MCP サーバーにしてみた」](https://hfm.tokyo/blog/author-style-context-mcp)で紹介した、文体ガイドの意味単位での保存、用途別の取得、Notion からの同期を実装しています。著者の文体ガイドや個人データは含めず、サンプルの著者 ID、本文、設定値を使用します。
+[HF.M](https://hfm.tokyo/) の[技術記事「記事再現ガイドを TiDB と Cloudflare Workers のリモート MCP サーバーにしてみた」](https://hfm.tokyo/blog/author-style-context-mcp)で紹介した、文体ガイドの意味単位での保存、用途別の取得、Notion からの同期を実装しています。著者の文体ガイドや個人データは含めず、サンプルの著者 ID、本文、設定値を使用します。
 
 ## 全体像
 
